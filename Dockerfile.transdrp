@@ -1,0 +1,135 @@
+FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /workspace/TransDRP
+
+# -----------------------------------------------------------------------------
+# System packages + Python 3.9
+# -----------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    git curl wget ca-certificates \
+    build-essential pkg-config \
+    libglib2.0-0 libgl1 libxrender1 libxext6 libsm6 libgomp1 \
+    && add-apt-repository ppa:deadsnakes/ppa -y \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    python3.9 python3.9-dev python3.9-venv python3.9-distutils \
+    && rm -rf /var/lib/apt/lists/*
+
+# NOTE:
+# The generic https://bootstrap.pypa.io/get-pip.py no longer supports Python 3.9.
+# Use the Python-3.9-specific bootstrap script and keep pip < 25 for stability.
+RUN curl -sS https://bootstrap.pypa.io/pip/3.9/get-pip.py | python3.9 \
+    && ln -sf /usr/bin/python3.9 /usr/local/bin/python \
+    && ln -sf /usr/local/bin/pip3.9 /usr/local/bin/pip \
+    && python -m pip install --upgrade \
+        "pip==24.3.1" \
+        "setuptools==75.8.0" \
+        "wheel==0.45.1"
+
+# -----------------------------------------------------------------------------
+# PyTorch stack: CUDA 12.1 + torch 2.1.0
+# -----------------------------------------------------------------------------
+RUN python -m pip install \
+    torch==2.1.0 \
+    torchvision==0.16.0 \
+    torchaudio==2.1.0 \
+    --index-url https://download.pytorch.org/whl/cu121
+
+# PyTorch Geometric extension wheels matched to torch 2.1.0 + CUDA 12.1.
+RUN python -m pip install \
+    pyg_lib==0.3.1+pt21cu121 \
+    torch-scatter==2.1.2+pt21cu121 \
+    torch-sparse==0.6.18+pt21cu121 \
+    torch-cluster==1.6.3+pt21cu121 \
+    torch-spline-conv==1.2.2+pt21cu121 \
+    torch-geometric==2.3.1 \
+    -f https://data.pyg.org/whl/torch-2.1.0+cu121.html
+
+# -----------------------------------------------------------------------------
+# TransDRP runtime/scientific dependencies
+# -----------------------------------------------------------------------------
+# pandas must be >= 2.2 because dataload.py uses:
+# pd.set_option('future.no_silent_downcasting', True)
+# Keep numpy < 2 to avoid compatibility issues with older scientific packages.
+RUN python -m pip install \
+    "numpy==1.26.4" \
+    "pandas==2.2.3" \
+    "scipy==1.11.4" \
+    "scikit-learn==1.3.2" \
+    "hickle==5.0.3" \
+    "deepchem==2.8.0" \
+    "rdkit==2023.9.6" \
+    "matplotlib==3.8.4" \
+    "tqdm==4.66.4" \
+    "networkx==3.1" \
+    "joblib==1.3.2" \
+    "packaging==24.2"
+
+# Build from a local TransDRP checkout.
+# Run docker build from inside the TransDRP repo directory.
+COPY . /workspace/TransDRP
+
+# -----------------------------------------------------------------------------
+# Project compatibility patches
+# -----------------------------------------------------------------------------
+# 1. Use the currently visible CUDA device instead of a hard-coded GPU index.
+# 2. Make the pandas option safe even if code is reused with an older pandas.
+RUN python - <<'PY'
+from pathlib import Path
+
+# Patch config.py device setting.
+p = Path('config.py')
+if p.exists():
+    s = p.read_text()
+    replacements = {
+        "CUDA_ID = 'cuda:2' if torch.cuda.is_available() else 'cpu'":
+            "CUDA_ID = torch.device('cuda' if torch.cuda.is_available() else 'cpu')",
+        "CUDA_ID = 'cuda:1' if torch.cuda.is_available() else 'cpu'":
+            "CUDA_ID = torch.device('cuda' if torch.cuda.is_available() else 'cpu')",
+        "CUDA_ID = 'cuda:0' if torch.cuda.is_available() else 'cpu'":
+            "CUDA_ID = torch.device('cuda' if torch.cuda.is_available() else 'cpu')",
+    }
+    for old, new in replacements.items():
+        s = s.replace(old, new)
+    p.write_text(s)
+
+# Patch dataload.py pandas option defensively.
+p = Path('dataload.py')
+if p.exists():
+    s = p.read_text()
+    old = "pd.set_option('future.no_silent_downcasting', True)"
+    new = """try:\n    pd.set_option('future.no_silent_downcasting', True)\nexcept Exception:\n    pass"""
+    if old in s and "future.no_silent_downcasting" in s and "try:" not in s.split(old)[0][-20:]:
+        s = s.replace(old, new)
+    p.write_text(s)
+PY
+
+# -----------------------------------------------------------------------------
+# Build-time sanity check
+# -----------------------------------------------------------------------------
+RUN python - <<'PY'
+import torch
+import torch_geometric
+import rdkit
+import deepchem
+import hickle
+import sklearn
+import pandas
+
+print('torch:', torch.__version__)
+print('torch cuda:', torch.version.cuda)
+print('cuda available during build:', torch.cuda.is_available())
+print('pyg:', torch_geometric.__version__)
+print('rdkit:', rdkit.__version__)
+print('deepchem:', deepchem.__version__)
+print('hickle:', hickle.__version__)
+print('sklearn:', sklearn.__version__)
+print('pandas:', pandas.__version__)
+PY
+
+CMD ["/bin/bash"]

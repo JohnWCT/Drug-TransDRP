@@ -1,0 +1,16 @@
+[tool.ruff]
+target-version = "py39"
+line-length = 120
+src = ["transdrp_multilabel", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "E741",   # ambiguous variable name (common in scientific code)
+    "F401",   # unused import (allow in __init__.py)
+    "E402",   # module level import not at top of file (common when adjusting sys.path)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
