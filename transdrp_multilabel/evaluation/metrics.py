@@ -206,7 +206,12 @@ def compute_metrics_from_predictions(
     if sub.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    if task_type == "regression":
+    # Target (TCGA) is ALWAYS a binary clinical response, so it is always evaluated
+    # with classification metrics (auc/aupr/f1/acc), even under a regression run.
+    # Only the source domain under a regression run uses regression metrics (MAE...).
+    use_regression = (task_type == "regression") and (domain == "source")
+
+    if use_regression:
         per = compute_regression_metrics_per_drug(sub)
         summ = compute_regression_metrics_summary(per, sub)
         return per, summ

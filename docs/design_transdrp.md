@@ -29,7 +29,7 @@ TransDRP/
       __init__.py
       sample_id.py                       # Sample ID normalization & TCGA matching
       omics.py                           # Gene feature intersection & alignment
-      drug_index.py                      # Drug list union extraction
+      drug_index.py                      # Final drug index (source drugs only) + availability categorization
       response_matrix.py                 # Long to wide response + mask matrix
       split.py                           # Stratified KFold splits
       cancer_type.py                     # Cancer type mapping
@@ -65,9 +65,9 @@ TransDRP/
 ## 2. Core Architectural Decisions
 
 ### AD-01: Drug Graph Construction under Regression Run (User Decision 1 - Option B)
-In regression runs, drug labels are continuous (e.g., Z-score, LN_IC50). To construct the GNN's drug co-occurrence adjacency matrix `config.label_graph`:
-* **Design**: The continuous response values of the source domain are temporarily binarized using a threshold (e.g., `Z_SCORE < 0` or a user-provided threshold) **only during the graph building phase**.
-* **Rationale**: This allows us to calculate the co-occurrence overlap matrix exactly as done in the classification task, keeping drug graph construction consistent and stable.
+In regression runs, drug labels are continuous (`-logAUC`). To construct the GNN's drug co-occurrence adjacency matrix `config.label_graph`:
+* **Design**: The continuous source response values are temporarily binarized **only during the graph building phase**, using the rule `sensitive = 1 if -logAUC > threshold` (threshold = `-log(0.5)`, exposed as `--regression_binary_threshold`). Direction rationale: lower AUC → higher `-logAUC` → more sensitive.
+* **Rationale**: This allows us to calculate the co-occurrence overlap matrix exactly as done in the classification task, keeping drug graph construction consistent and stable. The binarization is used ONLY for graph building and the TCGA hard-label threshold; the supervised source loss stays MAE on the raw `-logAUC`.
 
 ### AD-02: Tissue Contrastive Alignment under Regression Run (User Decision 2 - Option A)
 * **Design**: During regression fine-tuning, the tissue-specific contrastive learning loss ([InfoMax_loss](file:///home/wasijk/Drug/TransDRP/myloss.py#L62)) remains active.
@@ -80,6 +80,7 @@ In regression runs, drug labels are continuous (e.g., Z-score, LN_IC50). To cons
 
 ### AD-04: Target Labels usage
 * **Design**: Target domain (TCGA) response labels are used **exclusively for evaluation** and do not contribute to the supervised loss during domain adaptation fine-tuning, preserving the unsupervised domain adaptation setting.
+* **Metric type**: The target is always a **binary clinical response**, so target evaluation always uses classification metrics (`auc`, `aupr`, `f1`, `acc`) — even under a regression run. Under regression, AUROC/AUPR use the continuous predicted `-logAUC` score (rank-based), while F1/ACC use the hard label thresholded at `-log(0.5)`. Only the source domain under a regression run is scored with regression metrics (MAE, ...).
 
 ---
 
@@ -112,7 +113,7 @@ Represents the wide response and observed mask matrix.
 1. **Inputs**: Checkpoint from Stage 1, source/target omics tables, source/target response tables, source/target cancer type mapping paths, and drug SMILES CSV.
 2. **Data Pipeline**:
    * Align omics features.
-   * Extract unique drugs union and validate that all drugs exist in the SMILES CSV (raise error if any are missing).
+   * Build the final drug index from **source drugs only** (drop target-only drugs; keep source-only drugs) and validate that all source drugs exist in the SMILES CSV (raise error if any are missing). Write `drug_availability_report.csv` categorizing every drug as `source_and_target` / `source_only` / `target_only`.
    * Read response values from the column specified in `source_response_col` (e.g. `neg_log2_auc` or `Label`).
    * Construct GNN node features `config.drug_feat` (RDKit 64-bit fingerprints) and GNN drug graph adjacency matrix `config.label_graph` (binarized co-occurrence overlap based on response binarization threshold).
    * Generate K-fold splits on source samples.

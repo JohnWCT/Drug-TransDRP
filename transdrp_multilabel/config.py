@@ -107,11 +107,13 @@ def build_finetune_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--alph", type=float, default=None, help="Transfer loss coefficient")
     p.add_argument("--beta", type=float, default=None, help="Contrastive loss coefficient")
 
-    # SMILES and Cancer type paths
-    p.add_argument("--source_cancer_type_path", default=None)
-    p.add_argument("--target_cancer_type_path", default=None)
+    # SMILES and Cancer type paths.
+    # Cancer type maps are REQUIRED: tissue prototypes / latent analysis must run
+    # every fold, so a missing map is a hard error rather than a silent skip.
+    p.add_argument("--source_cancer_type_path", required=True)
+    p.add_argument("--target_cancer_type_path", required=True)
     p.add_argument("--cancer_type_col", default="Cancer_type")
-    p.add_argument("--drug_smiles_path", default=None)
+    p.add_argument("--drug_smiles_path", required=True)
 
     p.add_argument("--norm_flag", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--retrain_flag", action=argparse.BooleanOptionalAction, default=True)

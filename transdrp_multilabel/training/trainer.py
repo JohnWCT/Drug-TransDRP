@@ -90,6 +90,16 @@ def train_finetune(
     # Wrap encoder and classifier into the AdversarialNetwork wrapper
     # Note: We pass len(drug_ids) as the third argument (fix_source) to match legacy behavior
     n_drugs = node_x.size(0)
+
+    # Stability guard (req.8): total loss = alph*transfer + beta*contrastive
+    # + (1 - 2*alph)*pred. The supervised prediction term must keep a
+    # non-negative weight, otherwise training would push predictions to be wrong.
+    pred_loss_weight = 1.0 - 2.0 * config.alph
+    assert pred_loss_weight >= 0.0, (
+        f"Prediction loss weight (1 - 2*alph) = {pred_loss_weight:.4f} is negative; "
+        f"alph={config.alph} must be <= 0.5."
+    )
+
     da_network = AdversarialNetwork(encoder, classifier, fix_source=n_drugs).to(config.device)
     node_x = node_x.to(config.device)
     edge_index = edge_index.to(config.device)

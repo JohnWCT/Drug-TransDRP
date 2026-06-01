@@ -102,6 +102,7 @@ class PreparedFineTuneData:
     drug_index: DrugIndex
     folds: List[SourceFold]
     cancer_type_table: Optional[pd.DataFrame]
+    drug_availability: Optional[pd.DataFrame] = None
 
 @dataclass
 class TrainingResult:

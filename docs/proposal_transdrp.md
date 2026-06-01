@@ -18,8 +18,8 @@ main(args=args, params_dict=param,
 The objective is to convert this workflow into a **multi-label / multi-drug single-model framework** capable of predicting responses for all drugs present in your local datasets.
 
 The new workflow will:
-1. Dynamically extract the union of drugs from your local input tables.
-2. Train a single, shared model to predict sensitivity scores across all drugs simultaneously.
+1. Dynamically build the final drug index from **all source drugs** in your local input tables. target-only drugs (present only in the target response) are dropped: they are not evaluated and are not required to have SMILES. source-only drugs are kept for source training/validation.
+2. Train a single, shared model to predict sensitivity scores across all source drugs simultaneously.
 3. Replace hardcoded data-loading paths with general CLI paths for local tables.
 4. Support both **classification** and **regression** tasks.
 5. Match the entry script structure and output directory schema of the CODE-AE benchmark.
@@ -36,8 +36,8 @@ The core TransDRP components—Autoencoder (AE) pre-training, Graph MLP classifi
 | **Task Type** | Support both Classification & Regression | `--task_type classification` and `--task_type regression` are supported. |
 | **Model Head** | Shared Encoder + GNN Predictor | Replace the fixed 9-output GNN classifier with a dynamically sized GNN head outputting a `[Batch_Size, N_drugs]` tensor. |
 | **Target Labels** | Evaluation-Only | Consistent with TransDRP and CODE-AE designs, target labels (TCGA) are only used for validation/testing, not in the supervised training loss. |
-| **Drug List** | Dynamic Union | Extracted automatically from the union of source and target response tables. |
-| **SMILES Missing** | Raise Error & Stop | If a drug lacks a molecular structure in the SMILES mapping file, the program raises an error and halts execution. |
+| **Drug List** | Source drugs only | The final drug index = all source drugs. target-only drugs are dropped (not evaluated, no SMILES required); source-only drugs are kept. A `drug_availability_report.csv` records the `source_and_target` / `source_only` / `target_only` categories. |
+| **SMILES Missing** | Raise Error & Stop | If a **source** drug (i.e. one in the final drug index) lacks a molecular structure in the SMILES mapping file, the program raises an error and halts execution. target-only drugs are exempt. |
 | **Cancer Type Data** | External CLI Paths | Tissue/cancer types for contrastive alignment are provided via `--source_cancer_type_path` and `--target_cancer_type_path`. |
 | **Data Format** | Wide Matrix + Mask | Long tables are converted to wide matrices `[N_samples, N_drugs]` plus a binary mask `[N_samples, N_drugs]` indicating observed records. |
 | **Early Stopping** | Macro Average Metric | Validation macro metrics (e.g., `macro_auroc` for classification, `macro_mae` for regression) drive model checkpoint selection. |
@@ -114,7 +114,7 @@ Tables of shape `[N_samples, N_features]` containing continuous gene expression 
 ### 4.3 Drug SMILES Mapping File
 CSV containing mapping of drug names to their SMILES string (e.g. columns `drug_id` and `Isosmiles`).
 * The script reads this file to compute the 64-bit molecular RDKit fingerprints.
-* **If any drug in the response union is missing from this file, execution terminates immediately with a ValueError.**
+* **If any source drug (in the final drug index) is missing from this file, execution terminates immediately with a ValueError.** target-only drugs are dropped before this check and are therefore exempt.
 
 ### 4.4 Cancer Type Mapping File
 CSV containing mappings between sample/patient IDs and their respective tissue/cancer types. Used to extract tissue categories for CCLE and TCGA samples to calculate prototypes for the contrastive alignment loss ([InfoMax_loss](file:///home/wasijk/Drug/TransDRP/myloss.py#L62)).
@@ -127,7 +127,7 @@ CSV containing mappings between sample/patient IDs and their respective tissue/c
 ### 5.1 Dynamic Graph Construction
 The drug correlation graph ([config.label_graph](file:///home/wasijk/Drug/TransDRP/config.py#L37)) is constructed dynamically:
 * **Classification**: Built based on binary overlap co-occurrence similarity.
-* **Regression**: Built by temporarily binarizing the continuous response values (using `--source_response_col` e.g., `neg_log2_auc` and a threshold) only during the graph building phase to compute the co-occurrence overlap matrix, keeping graph construction identical.
+* **Regression**: Built by temporarily binarizing the continuous response values only during the graph building phase to compute the co-occurrence overlap matrix, keeping graph construction identical. Direction follows `-logAUC`: lower AUC → higher `-logAUC` → more sensitive, so `sensitive = 1 if value > threshold` (threshold = `-log(0.5)`; `--regression_binary_threshold`).
 
 ### 5.2 Multi-output Graph MLP
 The [GraphMLP](file:///home/wasijk/Drug/TransDRP/models.py#L50)'s GNN layers will process a graph containing $N$ drug nodes.

@@ -101,8 +101,10 @@ def build_drug_graph(y_source: np.ndarray, mask_source: np.ndarray, task_type: s
         labels = y_source.copy()
         labels[mask_source == 0] = 0
     else:
-        # User Decision 1 (Option B): Binarize regression values with threshold
-        labels = (y_source < reg_binary_threshold).astype(float)
+        # Regression (AD-01 / req.5): temporarily binarize -logAUC ONLY to build the
+        # co-occurrence graph. Direction: AUC low -> -logAUC high -> sensitive,
+        # so sensitive = 1 if -logAUC > threshold (threshold = -log(0.5)).
+        labels = (y_source > reg_binary_threshold).astype(float)
         labels[mask_source == 0] = 0.0
 
     # 2. Build overlap co-occurrence matrix
@@ -278,17 +280,33 @@ class FineTuneRunner:
         write_csv(data_align_df, os.path.join(self.config.output_dir, "data_alignment_report.csv"))
 
         # 3. drug_availability_report.csv
-        drug_avail_rows = []
-        for j, d in enumerate(prepared.drug_index.drug_ids):
-            src_obs = int(src_m[:, j].sum())
-            tgt_obs = int(tgt_m[:, j].sum())
-            drug_avail_rows.append({
-                "drug_id": d,
-                "drug_index": j,
-                "source_observed": src_obs,
-                "target_observed": tgt_obs
-            })
-        drug_avail_df = pd.DataFrame(drug_avail_rows)
+        # Start from the categorized availability over the source∪target union
+        # (source_and_target / source_only / target_only) and annotate the final
+        # index drugs with their observed-position counts and column index.
+        final_index = {d: j for j, d in enumerate(prepared.drug_index.drug_ids)}
+        if prepared.drug_availability is not None:
+            drug_avail_df = prepared.drug_availability.copy()
+        else:
+            drug_avail_df = pd.DataFrame(
+                [{"drug_id": d, "in_source": True, "in_target": False,
+                  "category": "source_only", "in_final_index": True}
+                 for d in prepared.drug_index.drug_ids]
+            )
+
+        def _drug_index(d: str):
+            return final_index.get(d, -1)
+
+        def _src_obs(d: str):
+            j = final_index.get(d)
+            return int(src_m[:, j].sum()) if j is not None else 0
+
+        def _tgt_obs(d: str):
+            j = final_index.get(d)
+            return int(tgt_m[:, j].sum()) if j is not None else 0
+
+        drug_avail_df["drug_index"] = drug_avail_df["drug_id"].map(_drug_index)
+        drug_avail_df["source_observed"] = drug_avail_df["drug_id"].map(_src_obs)
+        drug_avail_df["target_observed"] = drug_avail_df["drug_id"].map(_tgt_obs)
         write_csv(drug_avail_df, os.path.join(self.config.output_dir, "drug_availability_report.csv"))
 
         # Run across folds

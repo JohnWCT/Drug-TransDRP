@@ -66,15 +66,23 @@ def build_prediction_long_table(
                 "cancer_type": cancer_map.get(sid, "Unknown"),
             }
 
-            # Binary probability mapping for classification or target evaluation
-            if task_type == "classification" or (task_type == "regression" and domain == "target"):
+            # Binary mapping rules.
+            if task_type == "classification":
+                # score is a logit -> sigmoid -> probability, threshold at prediction_threshold.
                 prob = 1.0 / (1.0 + np.exp(-score))
                 row["probability"] = float(prob)
                 row["pred_label"] = int(prob >= prediction_threshold)
+            elif task_type == "regression" and domain == "target":
+                # Target ground truth is binary clinical response (1 = sensitive).
+                # Predicted value lives on the -logAUC scale, so:
+                #   - AUROC / AUPR use the CONTINUOUS pred_score (rank-based, no probability),
+                #   - F1 / ACC use a hard label thresholded at -log(0.5):
+                #     sensitive = 1 if -logAUC > threshold.
+                row["pred_label"] = int(score > regression_binary_threshold)
             elif task_type == "regression" and domain == "source":
-                # For regression source responder, lower score is sensitive (< threshold)
-                row["ground_truth_binary"] = int(gt < regression_binary_threshold)
-                row["pred_label"] = int(score < regression_binary_threshold)
+                # Source responder direction: -logAUC high -> sensitive.
+                row["ground_truth_binary"] = int(gt > regression_binary_threshold)
+                row["pred_label"] = int(score > regression_binary_threshold)
             rows.append(row)
 
     return pd.DataFrame(rows)
