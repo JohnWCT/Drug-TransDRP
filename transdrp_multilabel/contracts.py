@@ -53,6 +53,7 @@ class TransDRPMultilabelConfig:
     norm_flag: bool
     retrain_flag: bool
     device: str
+    threshold_label: float = 0.1
 
 @dataclass
 class OmicsTable:

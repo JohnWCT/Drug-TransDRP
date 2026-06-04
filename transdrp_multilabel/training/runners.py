@@ -23,6 +23,13 @@ from transdrp_multilabel.model.legacy_adapter import build_legacy_transdrp_compo
 from transdrp_multilabel.model.checkpoint import save_checkpoint, load_checkpoint
 from transdrp_multilabel.model.heads import MultiOutputDrugHead
 from transdrp_multilabel.training.trainer import train_finetune, get_tissue_prototypes
+from transdrp_multilabel.training.sample_filter import filter_config_by_cancer_type
+from transdrp_multilabel.training.drug_validation import (
+    validate_final_drug_index,
+    target_eval_drug_ids,
+    eval_drug_indices,
+)
+from transdrp_multilabel.validators import validate_folds
 from transdrp_multilabel.evaluation.prediction import predict_matrix, build_prediction_long_table
 from transdrp_multilabel.evaluation.metrics import compute_metrics_from_predictions
 from transdrp_multilabel.evaluation.latent_eval import compute_distribution_metrics, compute_kmeans_cancer_type_metrics
@@ -39,7 +46,10 @@ from transdrp_multilabel.config import config_to_dict
 import pickle
 
 def get_drug_features(drug_index: DrugIndex, smiles_path: str) -> torch.Tensor:
-    """Compute 64-bit RDKit fingerprints for all unique drugs."""
+    """Compute 64-bit RDKit fingerprints for final source drugs only.
+
+    Missing structural records or invalid SMILES raise immediately (no fallback).
+    """
     smiles_df = pd.read_csv(smiles_path, header=0)
     cols_lower = [str(c).lower().strip() for c in smiles_df.columns]
     smiles_df.columns = cols_lower
@@ -72,28 +82,52 @@ def get_drug_features(drug_index: DrugIndex, smiles_path: str) -> torch.Tensor:
 
     fp_list = []
     missing_drugs = []
+    invalid_drugs: list[tuple[str, str]] = []
     for d in drug_index.drug_ids:
         d_lower = str(d).strip().lower()
-        if d_lower in lookup:
-            smiles = lookup[d_lower]
-            mol = Chem.MolFromSmiles(smiles)
-            if mol is None:
-                mol = Chem.MolFromSmiles("CC")
-            fp = Chem.RDKFingerprint(mol, fpSize=64)
-            fp_list.append(np.array(fp))
-        else:
+        if d_lower not in lookup:
             missing_drugs.append(d)
+            continue
+        smiles = lookup[d_lower]
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            invalid_drugs.append((d, smiles))
+            continue
+        fp = Chem.RDKFingerprint(mol, fpSize=64)
+        fp_list.append(np.array(fp))
 
     if missing_drugs:
+        missing_lines = "\n".join(f"  - drug_id={d}" for d in missing_drugs)
         raise ValueError(
-            f"Smiles file '{smiles_path}' does not contain structural records for the "
-            f"following {len(missing_drugs)} drugs: {missing_drugs}. Halted execution."
+            f"Smiles file '{smiles_path}' does not contain structural records for "
+            f"{len(missing_drugs)} source drugs:\n{missing_lines}\n"
+            f"Suggestion: fix drug_smiles_path or provide a drug alias mapping."
+        )
+
+    if invalid_drugs:
+        invalid_lines = "\n".join(
+            f"  - drug_id={d}, smiles={s!r}, source={smiles_path}" for d, s in invalid_drugs
+        )
+        raise ValueError(
+            f"Invalid SMILES for {len(invalid_drugs)} source drugs (RDKit parse failed):\n"
+            f"{invalid_lines}\n"
+            f"Suggestion: fix SMILES or alias mapping. No fallback fingerprint is used."
         )
 
     return torch.from_numpy(np.array(fp_list)).float()
 
-def build_drug_graph(y_source: np.ndarray, mask_source: np.ndarray, task_type: str, reg_binary_threshold: float) -> torch.Tensor:
-    """Construct drug co-occurrence adjacency matrix."""
+def build_drug_graph(
+    y_source: np.ndarray,
+    mask_source: np.ndarray,
+    task_type: str,
+    reg_binary_threshold: float,
+    threshold_label: float = 0.1,
+) -> torch.Tensor:
+    """Construct drug co-occurrence adjacency matrix from source labels.
+
+    Uses ALL source labels (legacy main.py behaviour). ``threshold_label`` mirrors
+    the original ``--thres_label`` (default 0.1).
+    """
     n_drugs = y_source.shape[1]
 
     # 1. Binarize labels
@@ -101,9 +135,9 @@ def build_drug_graph(y_source: np.ndarray, mask_source: np.ndarray, task_type: s
         labels = y_source.copy()
         labels[mask_source == 0] = 0
     else:
-        # Regression (AD-01 / req.5): temporarily binarize -logAUC ONLY to build the
-        # co-occurrence graph. Direction: AUC low -> -logAUC high -> sensitive,
-        # so sensitive = 1 if -logAUC > threshold (threshold = -log(0.5)).
+        # Regression: binarize -log2(AUC) ONLY to build the co-occurrence graph.
+        # Direction: AUC low -> -log2(AUC) high -> sensitive,
+        # so sensitive = 1 if -log2(AUC) > threshold (default -log2(0.5) = 1.0).
         labels = (y_source > reg_binary_threshold).astype(float)
         labels[mask_source == 0] = 0.0
 
@@ -113,25 +147,20 @@ def build_drug_graph(y_source: np.ndarray, mask_source: np.ndarray, task_type: s
         for j in range(n_drugs):
             if idx == j:
                 continue
-            # Count overlaps
             overlap = np.sum((labels[:, idx] == 1.0) & (labels[:, j] == 1.0))
             label_graph[idx, j] = overlap
 
-    # Set diagonals to sum of active instances
     row, col = np.diag_indices_from(label_graph)
     label_graph[row, col] = np.sum(labels, axis=0)
 
-    # Column-wise normalization
     for col_idx in range(n_drugs):
         normalizer = np.sum(label_graph[:, col_idx])
         if normalizer > 0:
             label_graph[:, col_idx] = label_graph[:, col_idx] / normalizer
 
-    # Apply default co-occurrence threshold of 0.1
     adj = label_graph - np.diag(np.diag(label_graph))
-    adj = (adj >= 0.1).astype(int)
+    adj = (adj >= threshold_label).astype(int)
 
-    # Extract edge index
     x_indices, y_indices = np.where(adj == 1)
     edge_index = np.vstack((x_indices, y_indices))
 
@@ -208,28 +237,73 @@ class FineTuneRunner:
 
         # Save config
         config_dict = config_to_dict(self.config)
+        config_dict["regression_label_type"] = "-log2AUC"
+        config_dict["regression_binary_threshold_note"] = "-log2(0.5)=1.0"
+        config_dict["score_direction"] = "higher_is_sensitive"
         write_json(config_dict, os.path.join(self.config.output_dir, "config.json"))
 
-        # Prepare data
-        prepared = prepare_finetune_data(self.config)
+        # P0-5: filter samples with missing / Unknown cancer types before prepare
+        filtered_config, sample_filter_report = filter_config_by_cancer_type(self.config)
+        write_csv(
+            sample_filter_report,
+            os.path.join(self.config.output_dir, "sample_filtering_report.csv"),
+        )
 
-        # Save drug list
+        # Prepare data (drug index = source drugs only; built in data layer)
+        prepared = prepare_finetune_data(filtered_config)
+
+        # P0-1: runner-level final drug-set validation
+        source_drugs, target_drugs, shared_drugs, target_only_drugs = validate_final_drug_index(
+            prepared, self.config
+        )
+        tgt_eval_drug_ids = target_eval_drug_ids(
+            prepared.drug_index, shared_drugs, prepared.target_response.mask
+        )
+        tgt_eval_indices = eval_drug_indices(prepared.drug_index, tgt_eval_drug_ids)
+
+        # Save drug list (all source drugs)
         drug_df = pd.DataFrame({
             "drug_id": prepared.drug_index.drug_ids,
             "drug_index": list(range(len(prepared.drug_index.drug_ids)))
         })
         write_csv(drug_df, os.path.join(self.config.output_dir, "drug_list.csv"))
 
-        # Set up dynamic GNN features
+        # P0-3/4: SMILES check on final source drugs only (invalid -> error, no fallback)
         node_x = get_drug_features(prepared.drug_index, self.config.drug_smiles_path)
 
-        # Build global cancer type map
-        cancer_types = sorted(list(prepared.cancer_type_table["cancer_type"].unique()))
-        if "Unknown" not in cancer_types:
-            cancer_types.append("Unknown")
+        # Build cancer type map (no Unknown fallback — filtered samples already removed)
+        cancer_types = sorted(prepared.cancer_type_table["cancer_type"].unique().tolist())
+        if "Unknown" in cancer_types:
+            raise ValueError(
+                "Unknown cancer type found after filtering; samples should have been removed."
+            )
         cancer_type_map = {name: idx for idx, name in enumerate(cancer_types)}
 
-
+        # Assert fold splits do not contain removed samples
+        kept_source = set(prepared.source_omics.sample_ids)
+        kept_target = set(prepared.target_omics.sample_ids)
+        removed_source = set(
+            sample_filter_report.loc[
+                (sample_filter_report["domain"] == "source") & (~sample_filter_report["kept"]),
+                "sample_id",
+            ].astype(str)
+        )
+        removed_target = set(
+            sample_filter_report.loc[
+                (sample_filter_report["domain"] == "target") & (~sample_filter_report["kept"]),
+                "sample_id",
+            ].astype(str)
+        )
+        validate_folds(prepared.folds)
+        for fold in prepared.folds:
+            for sid in fold.train_sample_ids + fold.val_sample_ids + fold.test_sample_ids:
+                if sid not in kept_source:
+                    raise ValueError(f"Fold {fold.fold_id} contains filtered source sample: {sid}")
+                if sid in removed_source:
+                    raise ValueError(f"Fold {fold.fold_id} contains removed source sample: {sid}")
+            for sid in prepared.target_omics.sample_ids:
+                if sid in removed_target:
+                    raise ValueError(f"Target omics contains removed sample: {sid}")
 
         # Align variables for training dataloaders
         src_x = prepared.source_omics.x.values.astype("float32")
@@ -240,10 +314,22 @@ class FineTuneRunner:
         tgt_y = prepared.target_response.y.astype("float32")
         tgt_m = prepared.target_response.mask.astype("float32")
 
-        # Map samples to tissue index
         ct_map = dict(zip(prepared.cancer_type_table["sample_id"], prepared.cancer_type_table["cancer_type"]))
-        src_tissue = np.array([cancer_type_map.get(ct_map.get(sid, "Unknown"), cancer_type_map["Unknown"]) for sid in prepared.source_omics.sample_ids])
-        tgt_tissue = np.array([cancer_type_map.get(ct_map.get(sid, "Unknown"), cancer_type_map["Unknown"]) for sid in prepared.target_omics.sample_ids])
+        src_tissue = np.array([
+            cancer_type_map[ct_map[sid]] for sid in prepared.source_omics.sample_ids
+        ])
+        tgt_tissue = np.array([
+            cancer_type_map[ct_map[sid]] for sid in prepared.target_omics.sample_ids
+        ])
+
+        # P1-6: global drug graph from ALL source labels (legacy main.py)
+        global_edge_index = build_drug_graph(
+            src_y,
+            src_m,
+            self.config.task_type,
+            self.config.regression_binary_threshold,
+            self.config.threshold_label,
+        )
 
         all_folds_src_per_drug = []
         all_folds_tgt_per_drug = []
@@ -279,19 +365,25 @@ class FineTuneRunner:
         ])
         write_csv(data_align_df, os.path.join(self.config.output_dir, "data_alignment_report.csv"))
 
-        # 3. drug_availability_report.csv
-        # Start from the categorized availability over the source∪target union
-        # (source_and_target / source_only / target_only) and annotate the final
-        # index drugs with their observed-position counts and column index.
+        # 3. drug_availability_report.csv (source ∪ target for reporting)
         final_index = {d: j for j, d in enumerate(prepared.drug_index.drug_ids)}
         if prepared.drug_availability is not None:
             drug_avail_df = prepared.drug_availability.copy()
         else:
-            drug_avail_df = pd.DataFrame(
-                [{"drug_id": d, "in_source": True, "in_target": False,
-                  "category": "source_only", "in_final_index": True}
-                 for d in prepared.drug_index.drug_ids]
-            )
+            drug_avail_df = pd.DataFrame([
+                {
+                    "drug_id": d,
+                    "in_source": d in source_drugs,
+                    "in_target": d in target_drugs,
+                    "category": (
+                        "source_and_target" if d in shared_drugs
+                        else "source_only" if d in source_drugs
+                        else "target_only"
+                    ),
+                    "in_final_index": d in source_drugs,
+                }
+                for d in sorted(source_drugs | target_drugs)
+            ])
 
         def _drug_index(d: str):
             return final_index.get(d, -1)
@@ -319,10 +411,8 @@ class FineTuneRunner:
             val_idx = [src_sample_to_idx[sid] for sid in fold.val_sample_ids]
             test_idx = [src_sample_to_idx[sid] for sid in fold.test_sample_ids]
 
-            # Build training subset drug graph dynamically (no leak)
-            y_train_subset = src_y[train_idx]
-            mask_train_subset = src_m[train_idx]
-            edge_index = build_drug_graph(y_train_subset, mask_train_subset, self.config.task_type, self.config.regression_binary_threshold)
+            # Global drug graph shared across folds (legacy main.py)
+            edge_index = global_edge_index
 
             # Create dataloaders
             train_ds = TensorDataset(
@@ -346,7 +436,7 @@ class FineTuneRunner:
 
             train_loader = DataLoader(train_ds, batch_size=self.config.batch_size, shuffle=True)
             val_loader = DataLoader(val_ds, batch_size=self.config.batch_size, shuffle=False)
-            target_loader = DataLoader(target_ds, batch_size=self.config.batch_size, shuffle=True)
+            target_train_loader = DataLoader(target_ds, batch_size=self.config.batch_size, shuffle=True)
 
 
             # Initialize model components
@@ -380,7 +470,7 @@ class FineTuneRunner:
                 classifier=classifier,
                 train_loader=train_loader,
                 val_loader=val_loader,
-                target_loader=target_loader,
+                target_loader=target_train_loader,
                 node_x=node_x,
                 edge_index=edge_index,
                 prototypes=prototypes,
@@ -407,7 +497,8 @@ class FineTuneRunner:
                 tgt_scores, tgt_y, tgt_m, prepared.target_omics.sample_ids,
                 prepared.drug_index, "target", "test", self.config.task_type,
                 self.config.prediction_threshold, self.config.regression_binary_threshold,
-                fold.fold_id, self.config.seed, prepared.cancer_type_table
+                fold.fold_id, self.config.seed, prepared.cancer_type_table,
+                eval_drug_indices=tgt_eval_indices,
             )
 
             fold_dir = os.path.join(self.config.output_dir, f"fold_{fold.fold_id}")
@@ -428,13 +519,10 @@ class FineTuneRunner:
             all_folds_src_summary.append(src_sum.assign(fold=fold.fold_id))
             all_folds_tgt_summary.append(tgt_sum.assign(fold=fold.fold_id))
 
-            # Export latents
+            # Export latents (formal outputs: source/target pkl only)
             src_latent = extract_latent_table(da_network, prepared.source_omics, self.config.batch_size, self.config.device)
             tgt_latent = extract_latent_table(da_network, prepared.target_omics, self.config.batch_size, self.config.device)
-            write_csv(src_latent, os.path.join(fold_dir, "source_latent_representation.csv"))
-            write_csv(tgt_latent, os.path.join(fold_dir, "target_latent_representation.csv"))
 
-            # Save pickled latent dicts
             latent_cols = [c for c in src_latent.columns if c.startswith("latent_")]
             src_latent_dict = {row["sample_id"]: row[latent_cols].tolist() for _, row in src_latent.iterrows()}
             tgt_latent_dict = {row["sample_id"]: row[latent_cols].tolist() for _, row in tgt_latent.iterrows()}
@@ -444,8 +532,6 @@ class FineTuneRunner:
                 pickle.dump(tgt_latent_dict, f)
 
             combined_latent_dict = {**src_latent_dict, **tgt_latent_dict}
-            with open(os.path.join(fold_dir, "latent_representation.pkl"), "wb") as f:
-                pickle.dump(combined_latent_dict, f)
 
             # Distribution metrics (FID, MMD, Wasserstein)
             dist_metrics = compute_distribution_metrics(src_latent_dict, tgt_latent_dict)
@@ -525,21 +611,19 @@ class FineTuneRunner:
         write_csv(pd.DataFrame(split_rows), os.path.join(self.config.output_dir, "source_split.csv"))
 
         # 2. cancer_type_summary.csv
-        source_ct_sub = prepared.cancer_type_table[prepared.cancer_type_table["domain"] == "source"]
-        target_ct_sub = prepared.cancer_type_table[prepared.cancer_type_table["domain"] == "target"]
         cancer_type_summary_df = pd.DataFrame([
             {
                 "domain": "source",
                 "n_samples": len(prepared.source_omics.sample_ids),
-                "n_unknown": int((source_ct_sub["cancer_type"] == "Unknown").sum()),
-                "cancer_type_path": self.config.source_cancer_type_path
+                "n_removed_by_filter": int((~sample_filter_report.loc[sample_filter_report["domain"] == "source", "kept"]).sum()),
+                "cancer_type_path": self.config.source_cancer_type_path,
             },
             {
                 "domain": "target",
                 "n_samples": len(prepared.target_omics.sample_ids),
-                "n_unknown": int((target_ct_sub["cancer_type"] == "Unknown").sum()),
-                "cancer_type_path": self.config.target_cancer_type_path
-            }
+                "n_removed_by_filter": int((~sample_filter_report.loc[sample_filter_report["domain"] == "target", "kept"]).sum()),
+                "cancer_type_path": self.config.target_cancer_type_path,
+            },
         ])
         write_csv(cancer_type_summary_df, os.path.join(self.config.output_dir, "cancer_type_summary.csv"))
 
@@ -579,6 +663,7 @@ class FineTuneRunner:
             "feature_alignment_report.csv",
             "cancer_type_summary.csv",
             "data_alignment_report.csv",
+            "sample_filtering_report.csv",
             "drug_availability_report.csv",
             "source_split.csv",
             "fold_summary.csv",
@@ -605,11 +690,8 @@ class FineTuneRunner:
                 f"{f_prefix}/target_metrics_per_drug.csv",
                 f"{f_prefix}/source_metrics_summary.csv",
                 f"{f_prefix}/target_metrics_summary.csv",
-                f"{f_prefix}/source_latent_representation.csv",
                 f"{f_prefix}/source_latent_representation.pkl",
-                f"{f_prefix}/target_latent_representation.csv",
                 f"{f_prefix}/target_latent_representation.pkl",
-                f"{f_prefix}/latent_representation.pkl",
                 f"{f_prefix}/latent_distribution_metrics.csv",
                 f"{f_prefix}/kmeans_cancer_type_metrics.csv",
                 f"{f_prefix}/tsne_domain_mixing.png",

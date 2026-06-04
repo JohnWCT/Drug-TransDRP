@@ -94,7 +94,22 @@ def build_finetune_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--metric", default=None, help="Early stopping metric, e.g. macro_auroc or macro_mae")
     p.add_argument("--reg_loss", choices=["mae"], default="mae")
     p.add_argument("--prediction_threshold", type=float, default=0.5)
-    p.add_argument("--regression_binary_threshold", type=float, default=1.0)
+    p.add_argument(
+        "--regression_binary_threshold",
+        type=float,
+        default=1.0,
+        help=(
+            "Regression only. Threshold on -log2(AUC): used for (1) drug co-occurrence graph "
+            "binarization and (2) target hard pred_label for F1/ACC. Default 1.0 = -log2(0.5). "
+            "Not used for source MAE loss or target AUROC/AUPRC (raw pred_score)."
+        ),
+    )
+    p.add_argument(
+        "--threshold_label",
+        type=float,
+        default=0.1,
+        help="Minimum normalized co-occurrence to keep a drug-drug edge in the label graph (legacy --thres_label).",
+    )
     p.add_argument("--n_splits", type=int, default=5)
     p.add_argument("--source_test_size", type=float, default=0.25, help="Test ratio for evaluation")
 
@@ -167,6 +182,7 @@ def _resolve_config_dict(args: argparse.Namespace, mode: Literal["pretrain", "fi
         "reg_loss": "mae",
         "prediction_threshold": float(getattr(args, "prediction_threshold", 0.5)),
         "regression_binary_threshold": float(getattr(args, "regression_binary_threshold", 1.0)),
+        "threshold_label": float(getattr(args, "threshold_label", 0.1)),
         "source_cancer_type_path": getattr(args, "source_cancer_type_path", None),
         "target_cancer_type_path": getattr(args, "target_cancer_type_path", None),
         "cancer_type_col": getattr(args, "cancer_type_col", None),

@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Literal, Optional, List
 import numpy as np
 import pandas as pd
 import torch
@@ -37,6 +37,7 @@ def build_prediction_long_table(
     fold: int = 0,
     seed: int = 0,
     cancer_type_table: pd.DataFrame = None,
+    eval_drug_indices: Optional[List[int]] = None,
 ) -> pd.DataFrame:
     rows = []
     cancer_map = {}
@@ -44,8 +45,10 @@ def build_prediction_long_table(
         sub = cancer_type_table[cancer_type_table["domain"] == domain]
         cancer_map = dict(zip(sub["sample_id"].astype(str), sub["cancer_type"].astype(str)))
 
+    drug_indices = eval_drug_indices if eval_drug_indices is not None else list(range(len(drug_index.drug_ids)))
+
     for i, sid in enumerate(sample_ids):
-        for j, _drug_id in enumerate(drug_index.drug_ids):
+        for j in drug_indices:
             if mask[i, j] < 0.5:
                 continue
             gt = float(y[i, j])
@@ -63,7 +66,7 @@ def build_prediction_long_table(
                 "ground_truth": gt,
                 "mask": 1,
                 "pred_score": score,
-                "cancer_type": cancer_map.get(sid, "Unknown"),
+                "cancer_type": cancer_map.get(sid, ""),
             }
 
             # Binary mapping rules.
@@ -74,13 +77,13 @@ def build_prediction_long_table(
                 row["pred_label"] = int(prob >= prediction_threshold)
             elif task_type == "regression" and domain == "target":
                 # Target ground truth is binary clinical response (1 = sensitive).
-                # Predicted value lives on the -logAUC scale, so:
-                #   - AUROC / AUPR use the CONTINUOUS pred_score (rank-based, no probability),
-                #   - F1 / ACC use a hard label thresholded at -log(0.5):
-                #     sensitive = 1 if -logAUC > threshold.
+                # Predicted value lives on the -log2(AUC) scale, so:
+                #   - AUROC / AUPR use the CONTINUOUS pred_score (rank-based),
+                #   - F1 / ACC use a hard label thresholded at -log2(0.5) = 1.0:
+                #     sensitive = 1 if -log2(AUC) > threshold.
                 row["pred_label"] = int(score > regression_binary_threshold)
             elif task_type == "regression" and domain == "source":
-                # Source responder direction: -logAUC high -> sensitive.
+                # Source responder direction: -log2(AUC) high -> sensitive.
                 row["ground_truth_binary"] = int(gt > regression_binary_threshold)
                 row["pred_label"] = int(score > regression_binary_threshold)
             rows.append(row)
