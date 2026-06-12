@@ -2,91 +2,67 @@
 
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
-from typing import Optional
 
-from transdrp_multilabel.contracts import DrugIndex, PreparedFineTuneData, TransDRPMultilabelConfig
-from transdrp_multilabel.io import read_csv
+from transdrp_multilabel.contracts import DrugIndex
 
 
 def _normalize_drug(d: object) -> str:
     return str(d).strip().lower()
 
 
-def _drugs_from_response(df: pd.DataFrame, drug_col: str) -> set[str]:
+def _drugs_from_response(df: pd.DataFrame | None, drug_col: str) -> set[str]:
+    if df is None or df.empty:
+        return set()
     return {_normalize_drug(d) for d in df[drug_col].astype(str) if str(d).strip()}
 
 
 def validate_final_drug_index(
-    prepared: PreparedFineTuneData,
-    config: TransDRPMultilabelConfig,
-) -> tuple[set[str], set[str], set[str], set[str]]:
-    """Ensure final drug index equals all source drugs and excludes target-only drugs."""
-    src_df = read_csv(config.source_response_path)
-    tgt_df = read_csv(config.target_response_path)
+    drug_index: DrugIndex,
+    source_response: pd.DataFrame,
+    primary_target_response: pd.DataFrame | None,
+    auxiliary_target_response: pd.DataFrame | None,
+    target_only_response: pd.DataFrame | None,
+    drug_col: str,
+    smiles_path: str | None = None,
+) -> pd.DataFrame:
+    """Ensure final drug index equals source ∪ all target eval drugs."""
+    source_drugs = _drugs_from_response(source_response, drug_col)
+    primary_drugs = _drugs_from_response(primary_target_response, drug_col)
+    aux_drugs = _drugs_from_response(auxiliary_target_response, drug_col)
+    target_only_drugs = _drugs_from_response(target_only_response, drug_col)
+    all_target_eval = primary_drugs | aux_drugs | target_only_drugs
+    expected = source_drugs | all_target_eval
+    final_drugs = set(drug_index.drug_ids)
 
-    source_drugs = _drugs_from_response(src_df, config.drug_col)
-    target_drugs = _drugs_from_response(tgt_df, config.drug_col)
-    target_only = target_drugs - source_drugs
-    source_only = source_drugs - target_drugs
-    shared_drugs = source_drugs & target_drugs
-
-    final_drugs = set(prepared.drug_index.drug_ids)
-
-    if final_drugs != source_drugs:
-        extra = final_drugs - source_drugs
-        missing = source_drugs - final_drugs
-        parts = ["final drug_index must equal all source drugs."]
+    if final_drugs != expected:
+        extra = final_drugs - expected
+        missing = expected - final_drugs
+        parts = ["final drug_index must equal source ∪ target eval drugs."]
         if extra:
             parts.append(f"Unexpected drugs in index: {sorted(extra)[:10]}")
         if missing:
-            parts.append(f"Missing source drugs in index: {sorted(missing)[:10]}")
+            parts.append(f"Missing drugs in index: {sorted(missing)[:10]}")
         raise ValueError(" ".join(parts))
 
-    leaked = target_only & final_drugs
-    if leaked:
-        raise ValueError(
-            f"target-only drugs must not appear in final drug_index: {sorted(leaked)[:10]}"
-        )
+    if smiles_path:
+        from transdrp_multilabel.training.runners import get_drug_features
+        get_drug_features(drug_index, smiles_path)
 
-    if prepared.drug_availability is not None:
-        bad = prepared.drug_availability[
-            (prepared.drug_availability["category"] == "target_only")
-            & (prepared.drug_availability["in_final_index"] == True)  # noqa: E712
-        ]
-        if not bad.empty:
-            raise ValueError(
-                "drug_availability_report marks target-only drugs as in_final_index."
-            )
-
-    return source_drugs, target_drugs, shared_drugs, target_only
-
-
-def target_eval_drug_ids(
-    drug_index: DrugIndex,
-    shared_drugs: set[str],
-    target_mask: Optional[np.ndarray] = None,
-) -> list[str]:
-    """Drugs used for target prediction / metrics = source ∩ target with observations."""
-    if target_mask is None:
-        return sorted(shared_drugs)
-
-    eval_drugs = sorted(
-        d for d in shared_drugs
-        if d in drug_index.drug_to_index and target_mask[:, drug_index.drug_to_index[d]].sum() > 0
-    )
-    unexpected = {
-        drug_index.index_to_drug[j]
-        for j in range(drug_index.n_drugs)
-        if target_mask[:, j].sum() > 0
-    } - shared_drugs
-    if unexpected:
-        raise ValueError(
-            f"target-only drugs observed in target mask: {sorted(unexpected)[:10]}"
-        )
-    return eval_drugs
+    rows = []
+    for d in drug_index.drug_ids:
+        in_src = d in source_drugs
+        in_any_tgt = d in all_target_eval
+        rows.append({
+            "drug_id": d,
+            "drug_index": drug_index.drug_to_index[d],
+            "in_source": in_src,
+            "in_any_target_eval": in_any_tgt,
+            "has_supervised_source_label": in_src,
+            "is_target_eval_only": (not in_src) and in_any_tgt,
+        })
+    return pd.DataFrame(rows)
 
 
 def eval_drug_indices(drug_index: DrugIndex, eval_drug_ids_list: list[str]) -> list[int]:
-    return [drug_index.drug_to_index[d] for d in eval_drug_ids_list]
+    return [drug_index.drug_to_index[d] for d in eval_drug_ids_list if d in drug_index.drug_to_index]

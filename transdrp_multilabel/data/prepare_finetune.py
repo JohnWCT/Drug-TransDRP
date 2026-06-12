@@ -1,15 +1,25 @@
-from typing import Literal
+from __future__ import annotations
+
+from typing import Dict, Literal
 import pandas as pd
-from transdrp_multilabel.contracts import TransDRPMultilabelConfig, OmicsTable, PreparedFineTuneData
+from transdrp_multilabel.contracts import (
+    TransDRPMultilabelConfig,
+    OmicsTable,
+    PreparedFineTuneData,
+    TargetEvalDataset,
+)
 from transdrp_multilabel.data.sample_id import sample_match_key
 from transdrp_multilabel.data.cancer_type import load_and_align_cancer_types
 from transdrp_multilabel.data.drug_index import (
-    build_drug_availability,
-    build_drug_index_from_source,
+    build_drug_availability_from_eval_union,
+    build_drug_index_from_eval_union,
+    _drug_set,
 )
 from transdrp_multilabel.data.omics import align_omics_features, read_omics_table
 from transdrp_multilabel.data.response_matrix import long_to_response_matrix
 from transdrp_multilabel.data.split import split_source_samples
+from transdrp_multilabel.data.target_eval import prepare_target_eval_dataset
+from transdrp_multilabel.config import optional_data_path
 from transdrp_multilabel.io import read_csv
 from transdrp_multilabel.validators import (
     validate_omics_table,
@@ -17,9 +27,31 @@ from transdrp_multilabel.validators import (
     validate_response_matrix,
 )
 
+
+def _collect_target_eval_sample_keys(
+    dfs: list[pd.DataFrame | None],
+    sample_col: str,
+) -> set[str]:
+    keys: set[str] = set()
+    for df in dfs:
+        if df is None or df.empty:
+            continue
+        for s in df[sample_col].astype(str):
+            keys.add(sample_match_key(s, column_hint=sample_col))
+    return keys
+
+
 def prepare_finetune_data(config: TransDRPMultilabelConfig) -> PreparedFineTuneData:
-    if not config.source_response_path or not config.target_response_path:
-        raise ValueError("Fine-tune requires both source_response_path and target_response_path.")
+    primary_path = optional_data_path(config.target_eval_primary_response_path) or optional_data_path(
+        config.target_response_path
+    )
+    aux_path = optional_data_path(config.target_eval_aux_response_path)
+    target_only_path = optional_data_path(config.target_eval_target_only_response_path)
+    if not config.source_response_path or not primary_path:
+        raise ValueError(
+            "Fine-tune requires source_response_path and "
+            "(target_eval_primary_response_path or target_response_path)."
+        )
     if not config.drug_smiles_path:
         raise ValueError("Fine-tune requires drug_smiles_path for GNN drug node features.")
 
@@ -30,10 +62,12 @@ def prepare_finetune_data(config: TransDRPMultilabelConfig) -> PreparedFineTuneD
 
     source = read_omics_table(config.source_omics_path, config.source_sample_col, "source")
     target = read_omics_table(config.target_omics_path, config.target_sample_col, "target")
-    source, target, alignment = align_omics_features(source, target)
+    source, target, _alignment = align_omics_features(source, target)
 
     src_resp_df = read_csv(config.source_response_path)
-    tgt_resp_df = read_csv(config.target_response_path)
+    primary_tgt_resp_df = read_csv(primary_path)
+    aux_tgt_resp_df = read_csv(aux_path) if aux_path else None
+    target_only_resp_df = read_csv(target_only_path) if target_only_path else None
 
     validate_response_long_table(
         src_resp_df,
@@ -43,20 +77,26 @@ def prepare_finetune_data(config: TransDRPMultilabelConfig) -> PreparedFineTuneD
         config.task_type,
         "source",
     )
-    validate_response_long_table(
-        tgt_resp_df,
-        config.target_response_sample_col,
-        config.drug_col,
-        config.target_response_col,
-        config.task_type,
-        "target",
-    )
+    for df, name in (
+        (primary_tgt_resp_df, config.target_eval_primary_name),
+        (aux_tgt_resp_df, config.target_eval_aux_name),
+        (target_only_resp_df, config.target_eval_target_only_name),
+    ):
+        if df is not None:
+            validate_response_long_table(
+                df,
+                config.target_response_sample_col,
+                config.drug_col,
+                config.target_response_col,
+                config.task_type,
+                "target",
+            )
 
-    # Check that patient response matches target omics samples
-    resp_keys = {
-        sample_match_key(s, column_hint=config.target_response_sample_col)
-        for s in tgt_resp_df[config.target_response_sample_col].astype(str)
-    }
+    # Target omics: keep samples appearing in ANY target eval response
+    resp_keys = _collect_target_eval_sample_keys(
+        [primary_tgt_resp_df, aux_tgt_resp_df, target_only_resp_df],
+        config.target_response_sample_col,
+    )
     keep = [
         sid
         for sid in target.sample_ids
@@ -71,56 +111,44 @@ def prepare_finetune_data(config: TransDRPMultilabelConfig) -> PreparedFineTuneD
                 domain="target",
             )
     else:
-        raise ValueError("No target omics samples matched to target response after ID normalization.")
-
-    # Build drug availability report over the union (for reporting only) and
-    # build the FINAL drug index from source drugs only. target-only drugs are
-    # dropped here: they are not evaluated and are not required to have SMILES.
-    drug_availability = build_drug_availability(src_resp_df, tgt_resp_df, config.drug_col)
-    drug_index = build_drug_index_from_source(src_resp_df, config.drug_col)
-
-    # Load SMILES and perform strict presence validation (Raise error and stop)
-    # NOTE: validation runs ONLY on the final source-drug index, so a target-only
-    # drug missing from the SMILES table will NOT halt execution.
-    smiles_df = pd.read_csv(config.drug_smiles_path, header=0)
-    cols_lower = [str(c).lower().strip() for c in smiles_df.columns]
-    smiles_df.columns = cols_lower
-
-    first_col = cols_lower[0]
-    name_col = None
-    for possible in ["name", "drug_name", "drug_id"]:
-        if possible in cols_lower and possible != first_col:
-            name_col = possible
-            break
-
-    smiles_keys = set()
-    for _, row in smiles_df.iterrows():
-        key1 = str(row[first_col]).strip().lower()
-        smiles_keys.add(key1)
-        if name_col:
-            key2 = str(row[name_col]).strip().lower()
-            smiles_keys.add(key2)
-
-    missing_drugs = []
-    for d in drug_index.drug_ids:
-        if str(d).strip().lower() not in smiles_keys:
-            missing_drugs.append(d)
-
-    if missing_drugs:
-        missing_lines = "\n".join(f"  - {d}" for d in missing_drugs)
         raise ValueError(
-            f"Missing SMILES for {len(missing_drugs)} source drugs:\n"
-            f"{missing_lines}\n\n"
-            f"These drugs are in the final source drug index and cannot be excluded "
-            f"automatically. Please fix drug_smiles_path ('{config.drug_smiles_path}') "
-            f"or provide a drug alias mapping. Halted execution."
+            "No target omics samples matched to any target eval response after ID normalization."
         )
 
-    # Convert response tables to wide matrices
+    drug_index = build_drug_index_from_eval_union(
+        source_response=src_resp_df,
+        primary_target_response=primary_tgt_resp_df,
+        auxiliary_target_response=aux_tgt_resp_df,
+        target_only_response=target_only_resp_df,
+        drug_col=config.drug_col,
+    )
+    source_drug_ids = _drug_set(src_resp_df, config.drug_col)
+
+    smiles_df = pd.read_csv(config.drug_smiles_path, header=0)
+    drug_availability = build_drug_availability_from_eval_union(
+        source_response=src_resp_df,
+        primary_target_response=primary_tgt_resp_df,
+        auxiliary_target_response=aux_tgt_resp_df,
+        target_only_response=target_only_resp_df,
+        drug_col=config.drug_col,
+        drug_index=drug_index,
+        smiles_df=smiles_df,
+    )
+
+    # Strict SMILES check on final drug index
+    missing_smiles = drug_availability.loc[~drug_availability["has_smiles"], "drug_id"].tolist()
+    if missing_smiles:
+        missing_lines = "\n".join(f"  - {d}" for d in missing_smiles)
+        raise ValueError(
+            f"Missing SMILES for final drug index drugs ({len(missing_smiles)}):\n"
+            f"{missing_lines}\n\n"
+            f"Please fix drug_smiles_path ('{config.drug_smiles_path}') "
+            f"or provide a drug alias mapping."
+        )
+
     src_sem: Literal["binary", "continuous"] = (
         "binary" if config.task_type == "classification" else "continuous"
     )
-    # Target is always evaluation-only binary labels
     tgt_sem: Literal["binary"] = "binary"
 
     source_response = long_to_response_matrix(
@@ -136,19 +164,39 @@ def prepare_finetune_data(config: TransDRPMultilabelConfig) -> PreparedFineTuneD
         omics_sample_id_col=config.source_sample_col,
         response_sample_id_col=config.source_sample_col,
     )
-    target_response = long_to_response_matrix(
-        tgt_resp_df,
-        list(target.sample_ids),
-        drug_index,
-        config.target_response_sample_col,
-        config.drug_col,
-        config.target_response_col,
-        "target",
-        tgt_sem,
-        "mean",
-        omics_sample_id_col=config.target_sample_col,
-        response_sample_id_col=config.target_response_sample_col,
-    )
+
+    # Target-only drugs: ensure source mask stays zero (no supervised loss)
+    for j, did in enumerate(drug_index.drug_ids):
+        if did not in source_drug_ids:
+            source_response.mask[:, j] = 0.0
+            source_response.y[:, j] = 0.0
+
+    target_eval_datasets: Dict[str, TargetEvalDataset] = {}
+    eval_specs = [
+        (config.target_eval_primary_name, primary_tgt_resp_df),
+        (config.target_eval_aux_name, aux_tgt_resp_df),
+        (config.target_eval_target_only_name, target_only_resp_df),
+    ]
+    for eval_name, eval_df in eval_specs:
+        if eval_df is None:
+            continue
+        target_eval_datasets[eval_name] = prepare_target_eval_dataset(
+            eval_response_df=eval_df,
+            eval_dataset_name=eval_name,
+            target_sample_ids=list(target.sample_ids),
+            drug_index=drug_index,
+            sample_col=config.target_response_sample_col,
+            drug_col=config.drug_col,
+            label_col=config.target_response_col,
+            task_type=config.task_type,
+            duplicate_strategy="mean",
+            omics_sample_id_col=config.target_sample_col,
+        )
+
+    if config.target_eval_primary_name not in target_eval_datasets:
+        raise ValueError("Primary target eval dataset could not be built.")
+
+    target_response = target_eval_datasets[config.target_eval_primary_name].response
 
     validate_response_matrix(source_response)
     validate_response_matrix(target_response)
@@ -178,5 +226,7 @@ def prepare_finetune_data(config: TransDRPMultilabelConfig) -> PreparedFineTuneD
         drug_index=drug_index,
         folds=folds,
         cancer_type_table=cancer_type_table,
+        target_eval_datasets=target_eval_datasets,
+        source_drug_ids=source_drug_ids,
         drug_availability=drug_availability,
     )

@@ -53,8 +53,7 @@ def compute_classification_metrics_per_drug(pred_df: pd.DataFrame) -> pd.DataFra
         y = g["ground_truth"].astype(int).to_numpy()
         y_score = _classification_scores(g)
         pred = g["pred_label"].astype(int).to_numpy()
-        rows.append(
-            {
+        row = {
                 "drug_id": drug_id,
                 "n_observed": len(g),
                 "n_positive": int((y == 1).sum()),
@@ -67,7 +66,11 @@ def compute_classification_metrics_per_drug(pred_df: pd.DataFrame) -> pd.DataFra
                 "recall": float(recall_score(y, pred, zero_division=0)),
                 "balanced_accuracy": float(balanced_accuracy_score(y, pred)),
             }
-        )
+        if "has_supervised_source_label" in g.columns:
+            row["has_supervised_source_label"] = bool(g["has_supervised_source_label"].iloc[0])
+        if "is_target_eval_only" in g.columns:
+            row["is_target_eval_only"] = bool(g["is_target_eval_only"].iloc[0])
+        rows.append(row)
     return pd.DataFrame(rows)
 
 def compute_classification_metrics_overall(pred_df: pd.DataFrame) -> dict[str, float]:

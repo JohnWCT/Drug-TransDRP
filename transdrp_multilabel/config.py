@@ -6,6 +6,30 @@ from pathlib import Path
 from typing import Any, Literal
 from transdrp_multilabel.contracts import TransDRPMultilabelConfig
 
+_TRANSDRP_ROOT = Path(__file__).resolve().parents[1]
+_DAPL_DATA = _TRANSDRP_ROOT.parent / "DAPL-master" / "data" / "TCGA"
+
+# Default target eval response CSVs (DAPL TCGA intersect splits)
+DEFAULT_TARGET_EVAL_PRIMARY_RESPONSE_PATH = str(
+    _DAPL_DATA / "PMID27354694_DR_OMICS_ad_intersect_pretrain_gdsc_intersect13.csv"
+)
+DEFAULT_TARGET_EVAL_AUX_RESPONSE_PATH = str(
+    _DAPL_DATA / "TCGA_drug_response_from_DAPL.csv"
+)
+DEFAULT_TARGET_EVAL_TARGET_ONLY_RESPONSE_PATH = str(
+    _DAPL_DATA / "PMID27354694_DR_OMICS_ad_intersect_pretrain_tcga_only3.csv"
+)
+
+
+def optional_data_path(path: str | None) -> str | None:
+    """Treat None, empty string, or literal 'none' as absent optional path."""
+    if path is None:
+        return None
+    if str(path).strip().lower() in ("", "none", "null"):
+        return None
+    return str(path)
+
+
 # Hardcoded defaults matching train_params.json in case it is missing
 _DEFAULT_JSON: dict[str, Any] = {
     "unlabeled": {
@@ -77,7 +101,14 @@ def build_finetune_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--source_omics_path", required=True)
     p.add_argument("--target_omics_path", required=True)
     p.add_argument("--source_response_path", required=True)
-    p.add_argument("--target_response_path", required=True)
+    p.add_argument(
+        "--target_response_path",
+        default=DEFAULT_TARGET_EVAL_PRIMARY_RESPONSE_PATH,
+        help=(
+            "Legacy target response path; used as primary target eval when "
+            "--target_eval_primary_response_path is not overridden."
+        ),
+    )
 
     p.add_argument("--source_sample_col", default="Sample_ID")
     p.add_argument("--target_sample_col", default="tissue_id")
@@ -129,6 +160,39 @@ def build_finetune_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--target_cancer_type_path", required=True)
     p.add_argument("--cancer_type_col", default="Cancer_type")
     p.add_argument("--drug_smiles_path", required=True)
+
+    # Target eval response paths (3-way eval; DAPL TCGA defaults)
+    p.add_argument(
+        "--target_eval_primary_response_path",
+        default=DEFAULT_TARGET_EVAL_PRIMARY_RESPONSE_PATH,
+        help=(
+            "Primary target eval response CSV. Defaults to DAPL "
+            "PMID27354694_DR_OMICS_ad_intersect_pretrain_gdsc_intersect13.csv"
+        ),
+    )
+    p.add_argument(
+        "--target_eval_aux_response_path",
+        default=DEFAULT_TARGET_EVAL_AUX_RESPONSE_PATH,
+        help="Auxiliary target eval response CSV. Pass 'none' to skip.",
+    )
+    p.add_argument(
+        "--target_eval_target_only_response_path",
+        default=DEFAULT_TARGET_EVAL_TARGET_ONLY_RESPONSE_PATH,
+        help="Target-only eval response CSV. Pass 'none' to skip.",
+    )
+
+    p.add_argument("--target_eval_primary_name", default="primary")
+    p.add_argument("--target_eval_aux_name", default="auxiliary")
+    p.add_argument("--target_eval_target_only_name", default="target_only")
+
+    p.add_argument("--drug_graph_edge_strategy", default="hybrid", choices=["hybrid", "source_cooccurrence"])
+    p.add_argument("--drug_graph_similarity_k", type=int, default=3)
+    p.add_argument("--drug_graph_similarity_threshold", type=float, default=0.3)
+    p.add_argument(
+        "--drug_graph_force_top1_if_isolated",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
 
     p.add_argument("--norm_flag", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--retrain_flag", action=argparse.BooleanOptionalAction, default=True)
@@ -187,6 +251,22 @@ def _resolve_config_dict(args: argparse.Namespace, mode: Literal["pretrain", "fi
         "target_cancer_type_path": getattr(args, "target_cancer_type_path", None),
         "cancer_type_col": getattr(args, "cancer_type_col", None),
         "drug_smiles_path": getattr(args, "drug_smiles_path", None),
+        "target_eval_primary_response_path": optional_data_path(
+            getattr(args, "target_eval_primary_response_path", None)
+        ),
+        "target_eval_aux_response_path": optional_data_path(
+            getattr(args, "target_eval_aux_response_path", None)
+        ),
+        "target_eval_target_only_response_path": optional_data_path(
+            getattr(args, "target_eval_target_only_response_path", None)
+        ),
+        "target_eval_primary_name": getattr(args, "target_eval_primary_name", "primary"),
+        "target_eval_aux_name": getattr(args, "target_eval_aux_name", "auxiliary"),
+        "target_eval_target_only_name": getattr(args, "target_eval_target_only_name", "target_only"),
+        "drug_graph_edge_strategy": getattr(args, "drug_graph_edge_strategy", "hybrid"),
+        "drug_graph_similarity_k": int(getattr(args, "drug_graph_similarity_k", 3)),
+        "drug_graph_similarity_threshold": float(getattr(args, "drug_graph_similarity_threshold", 0.3)),
+        "drug_graph_force_top1_if_isolated": bool(getattr(args, "drug_graph_force_top1_if_isolated", True)),
         "alph": alph,
         "beta": beta,
         "latent_dim": int(tp["latent_dim"]),
@@ -221,13 +301,20 @@ def config_from_finetune_args(args: argparse.Namespace) -> TransDRPMultilabelCon
     if metric is None:
         metric = "macro_auroc" if args.task_type == "classification" else "macro_mae"
 
+    # Primary eval falls back to legacy target_response_path when unset
+    primary_eval = optional_data_path(
+        getattr(args, "target_eval_primary_response_path", None)
+    ) or optional_data_path(getattr(args, "target_response_path", None))
+    target_response = optional_data_path(getattr(args, "target_response_path", None)) or primary_eval
+
     return TransDRPMultilabelConfig(
         task_type=args.task_type,
         source_response_path=args.source_response_path,
-        target_response_path=args.target_response_path,
+        target_response_path=target_response,
         pretrain_checkpoint=args.pretrain_checkpoint,
         metric=metric,
-        **d
+        target_eval_primary_response_path=primary_eval,
+        **{k: v for k, v in d.items() if k != "target_eval_primary_response_path"},
     )
 
 def config_to_dict(config: TransDRPMultilabelConfig) -> dict[str, Any]:

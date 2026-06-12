@@ -24,32 +24,29 @@ from transdrp_multilabel.model.checkpoint import save_checkpoint, load_checkpoin
 from transdrp_multilabel.model.heads import MultiOutputDrugHead
 from transdrp_multilabel.training.trainer import train_finetune, get_tissue_prototypes
 from transdrp_multilabel.training.sample_filter import filter_config_by_cancer_type
-from transdrp_multilabel.training.drug_validation import (
-    validate_final_drug_index,
-    target_eval_drug_ids,
-    eval_drug_indices,
-)
-from transdrp_multilabel.validators import validate_folds
-from transdrp_multilabel.evaluation.prediction import predict_matrix, build_prediction_long_table
-from transdrp_multilabel.evaluation.metrics import compute_metrics_from_predictions
-from transdrp_multilabel.evaluation.latent_eval import compute_distribution_metrics, compute_kmeans_cancer_type_metrics
+from transdrp_multilabel.training.drug_validation import validate_final_drug_index
+from transdrp_multilabel.model.drug_graph import build_drug_graph, build_hybrid_drug_graph
 from transdrp_multilabel.evaluation.reports import (
     aggregate_per_drug_metrics,
     aggregate_scalar_metrics,
     aggregate_summary_metrics,
-    build_combined_eval_summary
+    aggregate_target_eval_metrics_by_dataset,
+    aggregate_per_drug_metrics_by_dataset,
+    build_combined_eval_summary,
 )
+from transdrp_multilabel.evaluation.target_eval_reports import build_target_eval_zero_shot_drug_report
+from transdrp_multilabel.validators import validate_folds
+from transdrp_multilabel.evaluation.prediction import predict_matrix, build_prediction_long_table
+from transdrp_multilabel.evaluation.metrics import compute_metrics_from_predictions
+from transdrp_multilabel.evaluation.latent_eval import compute_distribution_metrics, compute_kmeans_cancer_type_metrics
 from transdrp_multilabel.export.latent import extract_latent_table
 from transdrp_multilabel.export.visualization import run_tsne, plot_tsne_by_domain, plot_tsne_by_cancer_type
-from transdrp_multilabel.io import write_json, ensure_clean_dir, write_csv
-from transdrp_multilabel.config import config_to_dict
+from transdrp_multilabel.io import write_json, ensure_clean_dir, write_csv, read_csv
+from transdrp_multilabel.config import config_to_dict, optional_data_path
 import pickle
 
 def get_drug_features(drug_index: DrugIndex, smiles_path: str) -> torch.Tensor:
-    """Compute 64-bit RDKit fingerprints for final source drugs only.
-
-    Missing structural records or invalid SMILES raise immediately (no fallback).
-    """
+    """Compute 64-bit RDKit fingerprints for all drugs in final drug index."""
     smiles_df = pd.read_csv(smiles_path, header=0)
     cols_lower = [str(c).lower().strip() for c in smiles_df.columns]
     smiles_df.columns = cols_lower
@@ -100,7 +97,7 @@ def get_drug_features(drug_index: DrugIndex, smiles_path: str) -> torch.Tensor:
         missing_lines = "\n".join(f"  - drug_id={d}" for d in missing_drugs)
         raise ValueError(
             f"Smiles file '{smiles_path}' does not contain structural records for "
-            f"{len(missing_drugs)} source drugs:\n{missing_lines}\n"
+            f"{len(missing_drugs)} final drug index drugs:\n{missing_lines}\n"
             f"Suggestion: fix drug_smiles_path or provide a drug alias mapping."
         )
 
@@ -109,62 +106,12 @@ def get_drug_features(drug_index: DrugIndex, smiles_path: str) -> torch.Tensor:
             f"  - drug_id={d}, smiles={s!r}, source={smiles_path}" for d, s in invalid_drugs
         )
         raise ValueError(
-            f"Invalid SMILES for {len(invalid_drugs)} source drugs (RDKit parse failed):\n"
+            f"Invalid SMILES for {len(invalid_drugs)} final drug index drugs (RDKit parse failed):\n"
             f"{invalid_lines}\n"
             f"Suggestion: fix SMILES or alias mapping. No fallback fingerprint is used."
         )
 
     return torch.from_numpy(np.array(fp_list)).float()
-
-def build_drug_graph(
-    y_source: np.ndarray,
-    mask_source: np.ndarray,
-    task_type: str,
-    reg_binary_threshold: float,
-    threshold_label: float = 0.1,
-) -> torch.Tensor:
-    """Construct drug co-occurrence adjacency matrix from source labels.
-
-    Uses ALL source labels (legacy main.py behaviour). ``threshold_label`` mirrors
-    the original ``--thres_label`` (default 0.1).
-    """
-    n_drugs = y_source.shape[1]
-
-    # 1. Binarize labels
-    if task_type == "classification":
-        labels = y_source.copy()
-        labels[mask_source == 0] = 0
-    else:
-        # Regression: binarize -log2(AUC) ONLY to build the co-occurrence graph.
-        # Direction: AUC low -> -log2(AUC) high -> sensitive,
-        # so sensitive = 1 if -log2(AUC) > threshold (default -log2(0.5) = 1.0).
-        labels = (y_source > reg_binary_threshold).astype(float)
-        labels[mask_source == 0] = 0.0
-
-    # 2. Build overlap co-occurrence matrix
-    label_graph = np.eye(n_drugs, dtype=float)
-    for idx in range(n_drugs):
-        for j in range(n_drugs):
-            if idx == j:
-                continue
-            overlap = np.sum((labels[:, idx] == 1.0) & (labels[:, j] == 1.0))
-            label_graph[idx, j] = overlap
-
-    row, col = np.diag_indices_from(label_graph)
-    label_graph[row, col] = np.sum(labels, axis=0)
-
-    for col_idx in range(n_drugs):
-        normalizer = np.sum(label_graph[:, col_idx])
-        if normalizer > 0:
-            label_graph[:, col_idx] = label_graph[:, col_idx] / normalizer
-
-    adj = label_graph - np.diag(np.diag(label_graph))
-    adj = (adj >= threshold_label).astype(int)
-
-    x_indices, y_indices = np.where(adj == 1)
-    edge_index = np.vstack((x_indices, y_indices))
-
-    return torch.from_numpy(edge_index).long()
 
 class PretrainRunner:
     def __init__(self, config: TransDRPMultilabelConfig) -> None:
@@ -249,26 +196,43 @@ class FineTuneRunner:
             os.path.join(self.config.output_dir, "sample_filtering_report.csv"),
         )
 
-        # Prepare data (drug index = source drugs only; built in data layer)
+        # Prepare data (drug index = source ∪ all target eval drugs)
         prepared = prepare_finetune_data(filtered_config)
 
-        # P0-1: runner-level final drug-set validation
-        source_drugs, target_drugs, shared_drugs, target_only_drugs = validate_final_drug_index(
-            prepared, self.config
-        )
-        tgt_eval_drug_ids = target_eval_drug_ids(
-            prepared.drug_index, shared_drugs, prepared.target_response.mask
-        )
-        tgt_eval_indices = eval_drug_indices(prepared.drug_index, tgt_eval_drug_ids)
+        primary_path = optional_data_path(
+            filtered_config.target_eval_primary_response_path
+        ) or optional_data_path(filtered_config.target_response_path)
+        aux_path = optional_data_path(filtered_config.target_eval_aux_response_path)
+        target_only_path = optional_data_path(filtered_config.target_eval_target_only_response_path)
+        primary_tgt_df = read_csv(primary_path) if primary_path else None
+        aux_tgt_df = read_csv(aux_path) if aux_path else None
+        target_only_df = read_csv(target_only_path) if target_only_path else None
 
-        # Save drug list (all source drugs)
-        drug_df = pd.DataFrame({
-            "drug_id": prepared.drug_index.drug_ids,
-            "drug_index": list(range(len(prepared.drug_index.drug_ids)))
-        })
-        write_csv(drug_df, os.path.join(self.config.output_dir, "drug_list.csv"))
+        validate_final_drug_index(
+            prepared.drug_index,
+            read_csv(filtered_config.source_response_path),
+            primary_tgt_df,
+            aux_tgt_df,
+            target_only_df,
+            filtered_config.drug_col,
+            smiles_path=filtered_config.drug_smiles_path,
+        )
 
-        # P0-3/4: SMILES check on final source drugs only (invalid -> error, no fallback)
+        # Save drug list with availability flags
+        if prepared.drug_availability is not None:
+            drug_list_df = prepared.drug_availability[
+                ["drug_id", "drug_index", "in_source", "in_target_primary",
+                 "in_target_auxiliary", "in_target_only_eval",
+                 "has_supervised_source_label", "is_target_eval_only"]
+            ].copy()
+        else:
+            drug_list_df = pd.DataFrame({
+                "drug_id": prepared.drug_index.drug_ids,
+                "drug_index": list(range(len(prepared.drug_index.drug_ids))),
+            })
+        write_csv(drug_list_df, os.path.join(self.config.output_dir, "drug_list.csv"))
+
+        # SMILES check on final drug index (invalid -> error, no fallback)
         node_x = get_drug_features(prepared.drug_index, self.config.drug_smiles_path)
 
         # Build cancer type map (no Unknown fallback — filtered samples already removed)
@@ -322,19 +286,39 @@ class FineTuneRunner:
             cancer_type_map[ct_map[sid]] for sid in prepared.target_omics.sample_ids
         ])
 
-        # P1-6: global drug graph from ALL source labels (legacy main.py)
-        global_edge_index = build_drug_graph(
-            src_y,
-            src_m,
-            self.config.task_type,
-            self.config.regression_binary_threshold,
-            self.config.threshold_label,
+        # Global drug graph from SOURCE labels only (+ hybrid similarity edges)
+        if self.config.drug_graph_edge_strategy == "hybrid":
+            global_edge_index, drug_graph_edge_report = build_hybrid_drug_graph(
+                y_source=src_y,
+                mask_source=src_m,
+                drug_index=prepared.drug_index,
+                source_drug_ids=prepared.source_drug_ids,
+                smiles_path=self.config.drug_smiles_path,
+                task_type=self.config.task_type,
+                reg_binary_threshold=self.config.regression_binary_threshold,
+                threshold_label=self.config.threshold_label,
+                similarity_k=self.config.drug_graph_similarity_k,
+                similarity_threshold=self.config.drug_graph_similarity_threshold,
+                force_top1_if_isolated=self.config.drug_graph_force_top1_if_isolated,
+            )
+        else:
+            global_edge_index = build_drug_graph(
+                src_y, src_m, self.config.task_type,
+                self.config.regression_binary_threshold, self.config.threshold_label,
+            )
+            drug_graph_edge_report = pd.DataFrame()
+
+        write_csv(
+            drug_graph_edge_report,
+            os.path.join(self.config.output_dir, "drug_graph_edge_report.csv"),
         )
 
         all_folds_src_per_drug = []
         all_folds_tgt_per_drug = []
         all_folds_src_summary = []
         all_folds_tgt_summary = []
+        all_folds_tgt_eval_summary_by_ds: dict[str, list[pd.DataFrame]] = {}
+        all_folds_tgt_eval_per_drug_by_ds: dict[str, list[pd.DataFrame]] = {}
         all_folds_latent_metrics = []
         all_folds_kmeans = []
         all_folds_summary_rows = []
@@ -365,41 +349,29 @@ class FineTuneRunner:
         ])
         write_csv(data_align_df, os.path.join(self.config.output_dir, "data_alignment_report.csv"))
 
-        # 3. drug_availability_report.csv (source ∪ target for reporting)
-        final_index = {d: j for j, d in enumerate(prepared.drug_index.drug_ids)}
+        # 3. drug_availability_report.csv
         if prepared.drug_availability is not None:
             drug_avail_df = prepared.drug_availability.copy()
         else:
-            drug_avail_df = pd.DataFrame([
-                {
-                    "drug_id": d,
-                    "in_source": d in source_drugs,
-                    "in_target": d in target_drugs,
-                    "category": (
-                        "source_and_target" if d in shared_drugs
-                        else "source_only" if d in source_drugs
-                        else "target_only"
-                    ),
-                    "in_final_index": d in source_drugs,
-                }
-                for d in sorted(source_drugs | target_drugs)
-            ])
-
-        def _drug_index(d: str):
-            return final_index.get(d, -1)
-
-        def _src_obs(d: str):
-            j = final_index.get(d)
-            return int(src_m[:, j].sum()) if j is not None else 0
-
-        def _tgt_obs(d: str):
-            j = final_index.get(d)
-            return int(tgt_m[:, j].sum()) if j is not None else 0
-
-        drug_avail_df["drug_index"] = drug_avail_df["drug_id"].map(_drug_index)
-        drug_avail_df["source_observed"] = drug_avail_df["drug_id"].map(_src_obs)
-        drug_avail_df["target_observed"] = drug_avail_df["drug_id"].map(_tgt_obs)
+            drug_avail_df = pd.DataFrame()
         write_csv(drug_avail_df, os.path.join(self.config.output_dir, "drug_availability_report.csv"))
+
+        # 4. target_eval_dataset_report.csv
+        eval_report_parts = [
+            ds.report for ds in prepared.target_eval_datasets.values()
+        ]
+        if eval_report_parts:
+            write_csv(
+                pd.concat(eval_report_parts, ignore_index=True),
+                os.path.join(self.config.output_dir, "target_eval_dataset_report.csv"),
+            )
+
+        # 5. target_eval_zero_shot_drug_report.csv
+        zero_shot_report = build_target_eval_zero_shot_drug_report(prepared, drug_graph_edge_report)
+        write_csv(
+            zero_shot_report,
+            os.path.join(self.config.output_dir, "target_eval_zero_shot_drug_report.csv"),
+        )
 
         # Run across folds
         for fold in prepared.folds:
@@ -491,33 +463,61 @@ class FineTuneRunner:
                 src_test_scores, src_test_y, src_test_m, fold.test_sample_ids,
                 prepared.drug_index, "source", "test", self.config.task_type,
                 self.config.prediction_threshold, self.config.regression_binary_threshold,
-                fold.fold_id, self.config.seed, prepared.cancer_type_table
-            )
-            tgt_pred_long = build_prediction_long_table(
-                tgt_scores, tgt_y, tgt_m, prepared.target_omics.sample_ids,
-                prepared.drug_index, "target", "test", self.config.task_type,
-                self.config.prediction_threshold, self.config.regression_binary_threshold,
                 fold.fold_id, self.config.seed, prepared.cancer_type_table,
-                eval_drug_indices=tgt_eval_indices,
+                eval_dataset="",
+                source_drug_ids=prepared.source_drug_ids,
             )
 
             fold_dir = os.path.join(self.config.output_dir, f"fold_{fold.fold_id}")
+            write_csv(src_pred_long, os.path.join(fold_dir, "source_test_prediction_results.csv"))
+            # Backward-compatible alias
             write_csv(src_pred_long, os.path.join(fold_dir, "source_prediction_results.csv"))
-            write_csv(tgt_pred_long, os.path.join(fold_dir, "target_prediction_results.csv"))
 
-            # Compute fold metrics
             src_per, src_sum = compute_metrics_from_predictions(src_pred_long, self.config.task_type, "source")
-            tgt_per, tgt_sum = compute_metrics_from_predictions(tgt_pred_long, self.config.task_type, "target")
-
+            write_csv(src_per, os.path.join(fold_dir, "source_test_metrics_per_drug.csv"))
+            write_csv(src_sum, os.path.join(fold_dir, "source_test_metrics_summary.csv"))
             write_csv(src_per, os.path.join(fold_dir, "source_metrics_per_drug.csv"))
             write_csv(src_sum, os.path.join(fold_dir, "source_metrics_summary.csv"))
-            write_csv(tgt_per, os.path.join(fold_dir, "target_metrics_per_drug.csv"))
-            write_csv(tgt_sum, os.path.join(fold_dir, "target_metrics_summary.csv"))
 
             all_folds_src_per_drug.append(src_per.assign(fold=fold.fold_id))
-            all_folds_tgt_per_drug.append(tgt_per.assign(fold=fold.fold_id))
             all_folds_src_summary.append(src_sum.assign(fold=fold.fold_id))
-            all_folds_tgt_summary.append(tgt_sum.assign(fold=fold.fold_id))
+
+            # Target eval: one forward pass, multiple eval datasets
+            for eval_name, eval_ds in prepared.target_eval_datasets.items():
+                eval_y = eval_ds.response.y.astype("float32")
+                eval_m = eval_ds.response.mask.astype("float32")
+                tgt_pred_long = build_prediction_long_table(
+                    tgt_scores, eval_y, eval_m, prepared.target_omics.sample_ids,
+                    prepared.drug_index, "target", "target_eval", self.config.task_type,
+                    self.config.prediction_threshold, self.config.regression_binary_threshold,
+                    fold.fold_id, self.config.seed, prepared.cancer_type_table,
+                    eval_dataset=eval_name,
+                    source_drug_ids=prepared.source_drug_ids,
+                )
+                file_prefix = f"target_{eval_name}"
+                write_csv(tgt_pred_long, os.path.join(fold_dir, f"{file_prefix}_prediction_results.csv"))
+
+                tgt_per, tgt_sum = compute_metrics_from_predictions(tgt_pred_long, self.config.task_type, "target")
+                write_csv(tgt_per, os.path.join(fold_dir, f"{file_prefix}_metrics_per_drug.csv"))
+                write_csv(tgt_sum, os.path.join(fold_dir, f"{file_prefix}_metrics_summary.csv"))
+
+                if eval_name not in all_folds_tgt_eval_per_drug_by_ds:
+                    all_folds_tgt_eval_per_drug_by_ds[eval_name] = []
+                    all_folds_tgt_eval_summary_by_ds[eval_name] = []
+                all_folds_tgt_eval_per_drug_by_ds[eval_name].append(
+                    tgt_per.assign(fold=fold.fold_id, eval_dataset=eval_name)
+                )
+                all_folds_tgt_eval_summary_by_ds[eval_name].append(
+                    tgt_sum.assign(fold=fold.fold_id, eval_dataset=eval_name)
+                )
+
+                # Backward compat: primary eval also writes legacy target_* files
+                if eval_name == self.config.target_eval_primary_name:
+                    write_csv(tgt_pred_long, os.path.join(fold_dir, "target_prediction_results.csv"))
+                    write_csv(tgt_per, os.path.join(fold_dir, "target_metrics_per_drug.csv"))
+                    write_csv(tgt_sum, os.path.join(fold_dir, "target_metrics_summary.csv"))
+                    all_folds_tgt_per_drug.append(tgt_per.assign(fold=fold.fold_id))
+                    all_folds_tgt_summary.append(tgt_sum.assign(fold=fold.fold_id))
 
             # Export latents (formal outputs: source/target pkl only)
             src_latent = extract_latent_table(da_network, prepared.source_omics, self.config.batch_size, self.config.device)
@@ -649,6 +649,55 @@ class FineTuneRunner:
         if all_folds_tgt_per_drug:
             write_csv(aggregate_per_drug_metrics(all_folds_tgt_per_drug), os.path.join(self.config.output_dir, "target_eval_metrics_per_drug_fold_mean_std.csv"))
 
+        # Target eval metrics grouped by eval_dataset
+        all_tgt_eval_summary_across = []
+        all_tgt_eval_summary_fold_std = []
+        all_tgt_eval_per_drug_across = []
+        all_tgt_eval_per_drug_fold_std = []
+        for eval_name, frames in all_folds_tgt_eval_summary_by_ds.items():
+            if frames:
+                combined = pd.concat(frames, ignore_index=True)
+                all_tgt_eval_summary_across.append(combined)
+                write_csv(
+                    combined,
+                    os.path.join(self.config.output_dir, f"target_{eval_name}_metrics_summary_across_folds.csv"),
+                )
+                fold_std = aggregate_target_eval_metrics_by_dataset(frames)
+                if not fold_std.empty:
+                    all_tgt_eval_summary_fold_std.append(fold_std)
+        for eval_name, frames in all_folds_tgt_eval_per_drug_by_ds.items():
+            if frames:
+                combined = pd.concat(frames, ignore_index=True)
+                all_tgt_eval_per_drug_across.append(combined)
+                write_csv(
+                    combined,
+                    os.path.join(self.config.output_dir, f"target_{eval_name}_metrics_per_drug_across_folds.csv"),
+                )
+                fold_std = aggregate_per_drug_metrics_by_dataset(frames)
+                if not fold_std.empty:
+                    all_tgt_eval_per_drug_fold_std.append(fold_std)
+
+        if all_tgt_eval_summary_across:
+            write_csv(
+                pd.concat(all_tgt_eval_summary_across, ignore_index=True),
+                os.path.join(self.config.output_dir, "target_eval_metrics_summary_by_dataset_across_folds.csv"),
+            )
+        if all_tgt_eval_summary_fold_std:
+            write_csv(
+                pd.concat(all_tgt_eval_summary_fold_std, ignore_index=True),
+                os.path.join(self.config.output_dir, "target_eval_metrics_summary_by_dataset_fold_mean_std.csv"),
+            )
+        if all_tgt_eval_per_drug_across:
+            write_csv(
+                pd.concat(all_tgt_eval_per_drug_across, ignore_index=True),
+                os.path.join(self.config.output_dir, "target_eval_metrics_per_drug_by_dataset_across_folds.csv"),
+            )
+        if all_tgt_eval_per_drug_fold_std:
+            write_csv(
+                pd.concat(all_tgt_eval_per_drug_fold_std, ignore_index=True),
+                os.path.join(self.config.output_dir, "target_eval_metrics_per_drug_by_dataset_fold_mean_std.csv"),
+            )
+
         if all_folds_latent_metrics:
             write_csv(pd.concat(all_folds_latent_metrics, ignore_index=True), os.path.join(self.config.output_dir, "latent_metrics_summary.csv"))
 
@@ -665,38 +714,60 @@ class FineTuneRunner:
             "data_alignment_report.csv",
             "sample_filtering_report.csv",
             "drug_availability_report.csv",
+            "target_eval_dataset_report.csv",
+            "target_eval_zero_shot_drug_report.csv",
+            "drug_graph_edge_report.csv",
             "source_split.csv",
             "fold_summary.csv",
             "source_test_metrics_summary_across_folds.csv",
             "source_test_metrics_summary_fold_mean_std.csv",
             "target_eval_metrics_summary_across_folds.csv",
             "target_eval_metrics_summary_fold_mean_std.csv",
+            "target_eval_metrics_summary_by_dataset_across_folds.csv",
+            "target_eval_metrics_summary_by_dataset_fold_mean_std.csv",
+            "target_eval_metrics_per_drug_by_dataset_across_folds.csv",
+            "target_eval_metrics_per_drug_by_dataset_fold_mean_std.csv",
             "eval_metrics_summary_fold_mean_std.csv",
             "source_test_metrics_per_drug_fold_mean_std.csv",
             "target_eval_metrics_per_drug_fold_mean_std.csv",
             "latent_metrics_summary.csv",
             "kmeans_cancer_type_summary.csv",
-            "kmeans_cancer_type_fold_mean_std.csv"
+            "kmeans_cancer_type_fold_mean_std.csv",
         ]
+        for eval_name in prepared.target_eval_datasets:
+            manifest_files.extend([
+                f"target_{eval_name}_metrics_summary_across_folds.csv",
+                f"target_{eval_name}_metrics_per_drug_across_folds.csv",
+            ])
         for fold in prepared.folds:
             f_prefix = f"fold_{fold.fold_id}"
             manifest_files.extend([
                 f"{f_prefix}/checkpoint_load_report.json",
                 f"{f_prefix}/train_log.csv",
                 f"{f_prefix}/selection_report.json",
+                f"{f_prefix}/source_test_prediction_results.csv",
                 f"{f_prefix}/source_prediction_results.csv",
-                f"{f_prefix}/target_prediction_results.csv",
-                f"{f_prefix}/source_metrics_per_drug.csv",
-                f"{f_prefix}/target_metrics_per_drug.csv",
-                f"{f_prefix}/source_metrics_summary.csv",
-                f"{f_prefix}/target_metrics_summary.csv",
+                f"{f_prefix}/source_test_metrics_per_drug.csv",
+                f"{f_prefix}/source_test_metrics_summary.csv",
                 f"{f_prefix}/source_latent_representation.pkl",
                 f"{f_prefix}/target_latent_representation.pkl",
                 f"{f_prefix}/latent_distribution_metrics.csv",
                 f"{f_prefix}/kmeans_cancer_type_metrics.csv",
                 f"{f_prefix}/tsne_domain_mixing.png",
-                f"{f_prefix}/tsne_cancer_type.png"
+                f"{f_prefix}/tsne_cancer_type.png",
             ])
+            for eval_name in prepared.target_eval_datasets:
+                manifest_files.extend([
+                    f"{f_prefix}/target_{eval_name}_prediction_results.csv",
+                    f"{f_prefix}/target_{eval_name}_metrics_per_drug.csv",
+                    f"{f_prefix}/target_{eval_name}_metrics_summary.csv",
+                ])
+            if self.config.target_eval_primary_name in prepared.target_eval_datasets:
+                manifest_files.extend([
+                    f"{f_prefix}/target_prediction_results.csv",
+                    f"{f_prefix}/target_metrics_per_drug.csv",
+                    f"{f_prefix}/target_metrics_summary.csv",
+                ])
         write_json({"artifacts": manifest_files}, os.path.join(self.config.output_dir, "run_manifest.json"))
 
         print("\nMulti-label TransDRP execution completed successfully.")
