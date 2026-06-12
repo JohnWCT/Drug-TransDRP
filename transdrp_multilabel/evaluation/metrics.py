@@ -26,6 +26,24 @@ CLASSIFICATION_METRICS = (
 )
 REGRESSION_METRICS = ("mae", "rmse", "r2", "pearson", "spearman")
 
+_SKLEARN_PRED_LABEL_WARNING = "y_pred contains classes not in y_true"
+
+
+def _label_classification_metrics(y: np.ndarray, pred: np.ndarray) -> dict[str, float]:
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=_SKLEARN_PRED_LABEL_WARNING,
+            category=UserWarning,
+        )
+        return {
+            "f1": float(f1_score(y, pred, zero_division=0)),
+            "precision": float(precision_score(y, pred, zero_division=0)),
+            "recall": float(recall_score(y, pred, zero_division=0)),
+            "balanced_accuracy": float(balanced_accuracy_score(y, pred)),
+        }
+
+
 def _safe_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
     if len(np.unique(y_true)) < 2:
         return float("nan")
@@ -61,10 +79,7 @@ def compute_classification_metrics_per_drug(pred_df: pd.DataFrame) -> pd.DataFra
                 "auroc": _safe_auc(y, y_score),
                 "aupr": _safe_aupr(y, y_score),
                 "accuracy": float(accuracy_score(y, pred)),
-                "f1": float(f1_score(y, pred, zero_division=0)),
-                "precision": float(precision_score(y, pred, zero_division=0)),
-                "recall": float(recall_score(y, pred, zero_division=0)),
-                "balanced_accuracy": float(balanced_accuracy_score(y, pred)),
+                **_label_classification_metrics(y, pred),
             }
         if "has_supervised_source_label" in g.columns:
             row["has_supervised_source_label"] = bool(g["has_supervised_source_label"].iloc[0])
@@ -83,10 +98,7 @@ def compute_classification_metrics_overall(pred_df: pd.DataFrame) -> dict[str, f
         "auroc": _safe_auc(y, y_score),
         "aupr": _safe_aupr(y, y_score),
         "accuracy": float(accuracy_score(y, pred)),
-        "f1": float(f1_score(y, pred, zero_division=0)),
-        "precision": float(precision_score(y, pred, zero_division=0)),
-        "recall": float(recall_score(y, pred, zero_division=0)),
-        "balanced_accuracy": float(balanced_accuracy_score(y, pred)),
+        **_label_classification_metrics(y, pred),
     }
 
 def compute_classification_metrics_summary(per_drug: pd.DataFrame, pred_df: pd.DataFrame = None) -> pd.DataFrame:

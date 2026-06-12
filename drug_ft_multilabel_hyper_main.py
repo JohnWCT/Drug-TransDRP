@@ -2,7 +2,14 @@
 """Thin entry: TransDRP multilabel fine-tuning."""
 
 import sys
+import warnings
 from pathlib import Path
+
+warnings.filterwarnings(
+    "ignore",
+    message="y_pred contains classes not in y_true",
+    category=UserWarning,
+)
 
 _TRANSDRP_ROOT = Path(__file__).resolve().parent
 if str(_TRANSDRP_ROOT) not in sys.path:
