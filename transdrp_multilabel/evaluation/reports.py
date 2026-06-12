@@ -4,7 +4,20 @@ import pandas as pd
 import numpy as np
 
 def _metric_value_columns(df: pd.DataFrame) -> list[str]:
-    skip = {"drug_id", "n", "fold", "samples_used", "n_cancer_types", "k_eff"}
+    skip = {
+        "drug_id",
+        "n",
+        "fold",
+        "samples_used",
+        "n_cancer_types",
+        "k_eff",
+        "eval_dataset",
+        "has_supervised_source_label",
+        "is_target_eval_only",
+        "n_observed",
+        "n_positive",
+        "n_negative",
+    }
     return [c for c in df.columns if c not in skip and pd.api.types.is_numeric_dtype(df[c])]
 
 def aggregate_per_drug_metrics(fold_frames: list[pd.DataFrame]) -> pd.DataFrame:

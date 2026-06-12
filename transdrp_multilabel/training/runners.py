@@ -662,6 +662,15 @@ class FineTuneRunner:
                     combined,
                     os.path.join(self.config.output_dir, f"target_{eval_name}_metrics_summary_across_folds.csv"),
                 )
+                per_ds_summary_std = aggregate_summary_metrics(frames)
+                if not per_ds_summary_std.empty:
+                    write_csv(
+                        per_ds_summary_std,
+                        os.path.join(
+                            self.config.output_dir,
+                            f"target_{eval_name}_metrics_summary_fold_mean_std.csv",
+                        ),
+                    )
                 fold_std = aggregate_target_eval_metrics_by_dataset(frames)
                 if not fold_std.empty:
                     all_tgt_eval_summary_fold_std.append(fold_std)
@@ -673,6 +682,23 @@ class FineTuneRunner:
                     combined,
                     os.path.join(self.config.output_dir, f"target_{eval_name}_metrics_per_drug_across_folds.csv"),
                 )
+                per_ds_std = aggregate_per_drug_metrics(frames)
+                if not per_ds_std.empty:
+                    if "has_supervised_source_label" in combined.columns:
+                        flags = combined.groupby("drug_id").first()
+                        per_ds_std["has_supervised_source_label"] = per_ds_std["drug_id"].map(
+                            flags["has_supervised_source_label"]
+                        )
+                        per_ds_std["is_target_eval_only"] = per_ds_std["drug_id"].map(
+                            flags["is_target_eval_only"]
+                        )
+                    write_csv(
+                        per_ds_std,
+                        os.path.join(
+                            self.config.output_dir,
+                            f"target_{eval_name}_metrics_per_drug_fold_mean_std.csv",
+                        ),
+                    )
                 fold_std = aggregate_per_drug_metrics_by_dataset(frames)
                 if not fold_std.empty:
                     all_tgt_eval_per_drug_fold_std.append(fold_std)
@@ -737,7 +763,9 @@ class FineTuneRunner:
         for eval_name in prepared.target_eval_datasets:
             manifest_files.extend([
                 f"target_{eval_name}_metrics_summary_across_folds.csv",
+                f"target_{eval_name}_metrics_summary_fold_mean_std.csv",
                 f"target_{eval_name}_metrics_per_drug_across_folds.csv",
+                f"target_{eval_name}_metrics_per_drug_fold_mean_std.csv",
             ])
         for fold in prepared.folds:
             f_prefix = f"fold_{fold.fold_id}"
