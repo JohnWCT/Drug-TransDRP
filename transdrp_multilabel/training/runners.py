@@ -40,7 +40,7 @@ from transdrp_multilabel.evaluation.prediction import predict_matrix, build_pred
 from transdrp_multilabel.evaluation.metrics import compute_metrics_from_predictions
 from transdrp_multilabel.evaluation.latent_eval import compute_distribution_metrics, compute_kmeans_cancer_type_metrics
 from transdrp_multilabel.export.latent import extract_latent_table
-from transdrp_multilabel.export.visualization import run_tsne, plot_tsne_by_domain, plot_tsne_by_cancer_type
+from transdrp_multilabel.export.visualization import plot_tsne_dual_from_latent_frames
 from transdrp_multilabel.io import write_json, ensure_clean_dir, write_csv, read_csv
 from transdrp_multilabel.config import config_to_dict, optional_data_path
 import pickle
@@ -591,12 +591,13 @@ class FineTuneRunner:
                 "n_drugs": n_drugs
             })
 
-            # Generate t-SNE visualizations
-            combined_latent_df = pd.concat([src_latent, tgt_latent], ignore_index=True)
-            tsne_df = run_tsne(combined_latent_df, self.config.seed)
-            if tsne_df is not None:
-                plot_tsne_by_domain(tsne_df, os.path.join(fold_dir, "tsne_domain_mixing.png"))
-                plot_tsne_by_cancer_type(tsne_df, prepared.cancer_type_table, os.path.join(fold_dir, "tsne_cancer_type.png"))
+            plot_tsne_dual_from_latent_frames(
+                src_latent,
+                tgt_latent,
+                prepared.cancer_type_table,
+                os.path.join(fold_dir, "tsne_latent_dual.png"),
+                suptitle=f"TransDRP Latent t-SNE (Fold {fold.fold_id})",
+            )
 
         # Write global summaries
         # 1. source_split.csv
@@ -781,8 +782,7 @@ class FineTuneRunner:
                 f"{f_prefix}/target_latent_representation.pkl",
                 f"{f_prefix}/latent_distribution_metrics.csv",
                 f"{f_prefix}/kmeans_cancer_type_metrics.csv",
-                f"{f_prefix}/tsne_domain_mixing.png",
-                f"{f_prefix}/tsne_cancer_type.png",
+                f"{f_prefix}/tsne_latent_dual.png",
             ])
             for eval_name in prepared.target_eval_datasets:
                 manifest_files.extend([
