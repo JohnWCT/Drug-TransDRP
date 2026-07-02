@@ -215,6 +215,7 @@ class FineTuneRunner:
             aux_tgt_df,
             target_only_df,
             filtered_config.drug_col,
+            edge_strategy=self.config.drug_graph_edge_strategy,
             smiles_path=filtered_config.drug_smiles_path,
         )
 

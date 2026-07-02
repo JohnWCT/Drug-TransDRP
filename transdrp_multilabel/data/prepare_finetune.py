@@ -12,6 +12,7 @@ from transdrp_multilabel.data.sample_id import sample_match_key
 from transdrp_multilabel.data.cancer_type import load_and_align_cancer_types
 from transdrp_multilabel.data.drug_index import (
     build_drug_availability_from_eval_union,
+    build_drug_index_from_source,
     build_drug_index_from_eval_union,
     _drug_set,
 )
@@ -115,13 +116,21 @@ def prepare_finetune_data(config: TransDRPMultilabelConfig) -> PreparedFineTuneD
             "No target omics samples matched to any target eval response after ID normalization."
         )
 
-    drug_index = build_drug_index_from_eval_union(
-        source_response=src_resp_df,
-        primary_target_response=primary_tgt_resp_df,
-        auxiliary_target_response=aux_tgt_resp_df,
-        target_only_response=target_only_resp_df,
-        drug_col=config.drug_col,
-    )
+    if config.drug_graph_edge_strategy == "source_cooccurrence":
+        # Source-only mode: final drug index is limited to source drugs.
+        # Target eval rows containing out-of-source drugs are skipped downstream.
+        drug_index = build_drug_index_from_source(
+            source_response=src_resp_df,
+            drug_col=config.drug_col,
+        )
+    else:
+        drug_index = build_drug_index_from_eval_union(
+            source_response=src_resp_df,
+            primary_target_response=primary_tgt_resp_df,
+            auxiliary_target_response=aux_tgt_resp_df,
+            target_only_response=target_only_resp_df,
+            drug_col=config.drug_col,
+        )
     source_drug_ids = _drug_set(src_resp_df, config.drug_col)
 
     smiles_df = pd.read_csv(config.drug_smiles_path, header=0)

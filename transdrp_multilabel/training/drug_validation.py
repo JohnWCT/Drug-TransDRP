@@ -24,21 +24,28 @@ def validate_final_drug_index(
     auxiliary_target_response: pd.DataFrame | None,
     target_only_response: pd.DataFrame | None,
     drug_col: str,
+    edge_strategy: str = "hybrid",
     smiles_path: str | None = None,
 ) -> pd.DataFrame:
-    """Ensure final drug index equals source ∪ all target eval drugs."""
+    """Ensure final drug index matches configured edge strategy."""
     source_drugs = _drugs_from_response(source_response, drug_col)
     primary_drugs = _drugs_from_response(primary_target_response, drug_col)
     aux_drugs = _drugs_from_response(auxiliary_target_response, drug_col)
     target_only_drugs = _drugs_from_response(target_only_response, drug_col)
     all_target_eval = primary_drugs | aux_drugs | target_only_drugs
-    expected = source_drugs | all_target_eval
+    if edge_strategy == "source_cooccurrence":
+        expected = source_drugs
+    else:
+        expected = source_drugs | all_target_eval
     final_drugs = set(drug_index.drug_ids)
 
     if final_drugs != expected:
         extra = final_drugs - expected
         missing = expected - final_drugs
-        parts = ["final drug_index must equal source ∪ target eval drugs."]
+        if edge_strategy == "source_cooccurrence":
+            parts = ["final drug_index must equal source drugs only in source_cooccurrence mode."]
+        else:
+            parts = ["final drug_index must equal source ∪ target eval drugs."]
         if extra:
             parts.append(f"Unexpected drugs in index: {sorted(extra)[:10]}")
         if missing:
